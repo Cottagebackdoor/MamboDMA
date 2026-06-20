@@ -95,25 +95,34 @@ namespace MamboDMA.Games.DayZ
                 // If not attached yet, stop here to prevent any crashes
                 if (!attached) return;
 
+                var snap = DayZSnapshots.Current;
                 var cam  = DayZUpdater.DayZCameraSnapshots.Current;
                 var ents = DayZUpdater.EntitySnapshots.Current;
 
                 // ESP drawing
-                if (cfg.ShowPlayers)
+                if (cfg.EnableESP && cfg.ShowPlayers)
                     foreach (var p in ents.Where(e => e.Category == EntityType.Player))
-                        DrawBoxAround(p.Position, cfg.PlayerColor, cam);
+                        DrawEntityEsp(p, cfg.PlayerColor, cam, snap, cfg);
 
-                if (cfg.ShowZombies)
+                if (cfg.EnableESP && cfg.ShowZombies)
                     foreach (var z in ents.Where(e => e.Category == EntityType.Zombie))
-                        DrawBoxAround(z.Position, cfg.ZombieColor, cam);
+                        DrawEntityEsp(z, cfg.ZombieColor, cam, snap, cfg);
 
-                if (cfg.ShowLoot)
+                if (cfg.EnableESP && cfg.ShowLoot)
                     foreach (var item in ents.Where(e =>
                         e.Category == EntityType.Weapon || e.Category == EntityType.Ammo || e.Category == EntityType.Food))
-                        DrawBoxAround(item.Position, cfg.ItemColor, cam);
+                        DrawEntityEsp(item, cfg.ItemColor, cam, snap, cfg);
 
                 // Options
                 ImGui.Separator();
+                bool showNames = cfg.ShowNames;
+                if (ImGui.Checkbox("Show Names", ref showNames))
+                    cfg.ShowNames = showNames;
+
+                bool showDistance = cfg.ShowDistance;
+                if (ImGui.Checkbox("Show Distance", ref showDistance))
+                    cfg.ShowDistance = showDistance;
+
                 bool showDebugOverlay = cfg.ShowDebugOverlay;
                 if (ImGui.Checkbox("Show Debug Overlay", ref showDebugOverlay))
                     cfg.ShowDebugOverlay = showDebugOverlay;
@@ -194,8 +203,12 @@ namespace MamboDMA.Games.DayZ
                 {
                     ImGui.Text($"Near: 0x{snap.NearTable:X} ({snap.NearCount})");
                     ImGui.Text($"Far: 0x{snap.FarTable:X} ({snap.FarCount})");
-                    ImGui.Text($"Slow: 0x{snap.SlowTable:X} ({snap.SlowCount})");
-                    ImGui.Text($"Items: 0x{snap.ItemTable:X} ({snap.ItemCount})");
+                    ImGui.Text(
+                        $"Slow: 0x{snap.SlowTable:X} " +
+                        $"(valid {FormatCandidateCount(snap.SlowCount)} / allocated {snap.SlowAllocatedCount})");
+                    ImGui.Text(
+                        $"Items: 0x{snap.ItemTable:X} " +
+                        $"(valid {FormatCandidateCount(snap.ItemCount)} / allocated {snap.ItemAllocatedCount})");
                 }
 
                 if (ImGui.CollapsingHeader("Entities", ImGuiTreeNodeFlags.DefaultOpen))
@@ -276,9 +289,28 @@ namespace MamboDMA.Games.DayZ
             DrawLine($"Pos: {ent.Position.X:F1}, {ent.Position.Y:F1}, {ent.Position.Z:F1}", green);
         }
 
-        private static void DrawBoxAround(Vector3 worldPos, Vector4 color, DayZUpdater.DayZCamera? cam, float size = 20f)
+        private static void DrawEntityEsp(
+            Entity entity,
+            Vector4 color,
+            DayZUpdater.DayZCamera? cam,
+            DayZSnapshot snapshot,
+            DayZConfig cfg,
+            float size = 20f)
         {
-            if (!DayZUpdater.WorldToScreenDayZ(cam, worldPos,
+            if (snapshot.LocalPlayer != 0 && entity.Ptr == snapshot.LocalPlayer)
+                return;
+
+            Vector3 localPosition = snapshot.LocalPlayerPosition;
+            bool hasDistance = IsFinitePosition(localPosition);
+            float distance = hasDistance
+                ? Vector3.Distance(localPosition, entity.Position)
+                : 0f;
+            hasDistance = hasDistance && float.IsFinite(distance);
+
+            if (hasDistance && distance > cfg.MaxDrawDistance)
+                return;
+
+            if (!DayZUpdater.WorldToScreenDayZ(cam, entity.Position,
                     new Vector2(ScreenService.Current.W, ScreenService.Current.H), out var screenPos))
                 return;
 
@@ -290,7 +322,42 @@ namespace MamboDMA.Games.DayZ
             var max = new Vector2(screenPos.X + half, screenPos.Y + half);
 
             dl.AddRect(min, max, col, 0f, ImDrawFlags.None, 2f);
+
+            string name = !string.IsNullOrWhiteSpace(entity.DisplayName)
+                ? entity.DisplayName
+                : entity.Category.ToString();
+
+            string label = (cfg.ShowNames, cfg.ShowDistance && hasDistance) switch
+            {
+                (true, true) => $"{name} [{distance:F0}m]",
+                (true, false) => name,
+                (false, true) => $"{distance:F0}m",
+                _ => string.Empty
+            };
+
+            if (label.Length == 0)
+                return;
+
+            Vector2 textSize = ImGui.CalcTextSize(label);
+            var textPosition = new Vector2(
+                screenPos.X - (textSize.X * 0.5f),
+                min.Y - textSize.Y - 3f);
+
+            uint shadow = ImGui.ColorConvertFloat4ToU32(new Vector4(0f, 0f, 0f, 0.9f));
+            dl.AddText(textPosition + Vector2.One, shadow, label);
+            dl.AddText(textPosition, col, label);
         }
+
+        private static string FormatCandidateCount(int count)
+            => count >= 0 ? count.ToString() : "unknown";
+
+        // Vector3.Zero means the local-player position has not resolved yet, so it
+        // must not be used for distance filtering even though its components are finite.
+        private static bool IsFinitePosition(Vector3 position)
+            => float.IsFinite(position.X) &&
+               float.IsFinite(position.Y) &&
+               float.IsFinite(position.Z) &&
+               position != Vector3.Zero;
     }
 
     public sealed class DayZConfig
@@ -303,6 +370,8 @@ namespace MamboDMA.Games.DayZ
         public bool ShowPlayers { get; set; } = true;
         public bool ShowZombies { get; set; } = true;
         public bool ShowLoot { get; set; } = true;
+        public bool ShowNames { get; set; } = true;
+        public bool ShowDistance { get; set; } = true;
         public Vector4 ItemColor { get; set; } = new(1f, 1f, 0f, 1f);
 
         public bool ShowDebugOverlay { get; set; } = false;

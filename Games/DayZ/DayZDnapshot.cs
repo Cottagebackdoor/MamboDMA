@@ -13,6 +13,8 @@ namespace MamboDMA.Games.DayZ
         public static void Mutate(Func<DayZSnapshot, DayZSnapshot> mutate)
             => Publish(mutate(Current));
     }    
+    // Use named arguments when constructing this positional record. Issue #6 may
+    // replace it with explicit properties during the unified snapshot overhaul.
     public record DayZSnapshot(
         bool VmmReady,
         bool DmaAttached,
@@ -36,8 +38,10 @@ namespace MamboDMA.Games.DayZ
         ulong FarTable,
         int FarCount,
         ulong SlowTable,
+        int SlowAllocatedCount,
         int SlowCount,
         ulong ItemTable,
+        int ItemAllocatedCount,
         int ItemCount,
         int Players,
         int Zombies,
@@ -67,8 +71,10 @@ namespace MamboDMA.Games.DayZ
             FarTable: 0,
             FarCount: 0,
             SlowTable: 0,
+            SlowAllocatedCount: 0,
             SlowCount: 0,
             ItemTable: 0,
+            ItemAllocatedCount: 0,
             ItemCount: 0,
             Players: 0,
             Zombies: 0,

@@ -1,7 +1,9 @@
 #nullable enable
 
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using System.Text;
@@ -182,25 +184,27 @@ namespace MamboDMA.Games.DayZ
                     out localPlayerReference);
                 TryReadValue(world + DayZOffsets.World.PlayerOn, out playerOn);
 
-                near = ReadTable(
+                near = ReadFlatTable(
                     world,
                     DayZOffsets.World.NearEntityList,
                     DayZOffsets.World.NearTableSize,
                     NearEntityLimit);
-                far = ReadTable(
+                far = ReadFlatTable(
                     world,
                     DayZOffsets.World.FarEntityList,
                     DayZOffsets.World.FarTableSize,
                     FarEntityLimit);
-                slow = ReadTable(
+                slow = ReadStructuredTable(
                     world,
                     DayZOffsets.World.SlowEntityList,
                     DayZOffsets.World.SlowTableSize,
+                    DayZOffsets.World.SlowTableValidSize,
                     SlowEntityLimit);
-                items = ReadTable(
+                items = ReadStructuredTable(
                     world,
                     DayZOffsets.World.ItemList,
                     DayZOffsets.World.ItemListSize,
+                    DayZOffsets.World.ItemListValidSize,
                     ItemEntityLimit);
             }
 
@@ -235,13 +239,15 @@ namespace MamboDMA.Games.DayZ
                 PlayerOn: playerOn,
                 LocalPlayerPosition: localPlayerPosition,
                 NearTable: near.Pointer,
-                NearCount: near.Count,
+                NearCount: near.AllocatedCount,
                 FarTable: far.Pointer,
-                FarCount: far.Count,
+                FarCount: far.AllocatedCount,
                 SlowTable: slow.Pointer,
-                SlowCount: slow.Count,
+                SlowAllocatedCount: slow.AllocatedCount,
+                SlowCount: slow.ValidCount,
                 ItemTable: items.Pointer,
-                ItemCount: items.Count,
+                ItemAllocatedCount: items.AllocatedCount,
+                ItemCount: items.ValidCount,
                 Players: entities.Count(e => e.Category == EntityType.Player),
                 Zombies: entities.Count(e => e.Category == EntityType.Zombie),
                 Cars: entities.Count(e => e.Category == EntityType.Car));
@@ -289,6 +295,7 @@ namespace MamboDMA.Games.DayZ
                     }
 
                     bool logSamples = ShouldLog(ref _nextEntityDiagnostic, DiagnosticIntervalMs);
+                    long passStart = logSamples ? Stopwatch.GetTimestamp() : 0;
                     var byPointer = new Dictionary<ulong, Entity>();
 
                     AddTableEntities(
@@ -299,11 +306,17 @@ namespace MamboDMA.Games.DayZ
                         Entity.EnumerateEntities("Far", snapshot.FarTable, snapshot.FarCount, logSamples));
                     AddTableEntities(
                         byPointer,
-                        Entity.EnumerateEntities("Slow", snapshot.SlowTable, snapshot.SlowCount, logSamples));
+                        Entity.EnumerateStructuredEntities(
+                            "Slow",
+                            snapshot.SlowTable,
+                            snapshot.SlowAllocatedCount,
+                            snapshot.SlowCount,
+                            logSamples));
 
-                    var itemEntities = Entity.EnumerateEntities(
+                    var itemEntities = Entity.EnumerateStructuredEntities(
                         "Item",
                         snapshot.ItemTable,
+                        snapshot.ItemAllocatedCount,
                         snapshot.ItemCount,
                         logSamples);
                     AddTableEntities(byPointer, itemEntities);
@@ -318,6 +331,13 @@ namespace MamboDMA.Games.DayZ
                         Zombies = completeSnapshot.Count(e => e.Category == EntityType.Zombie),
                         Cars = completeSnapshot.Count(e => e.Category == EntityType.Car)
                     });
+
+                    if (logSamples)
+                    {
+                        Logger.Info(
+                            $"[DayZ/Perf] entityPass={Stopwatch.GetElapsedTime(passStart).TotalMilliseconds:F2}ms " +
+                            $"published={completeSnapshot.Length} itemEntities={itemEntities.Count}");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -902,7 +922,7 @@ namespace MamboDMA.Games.DayZ
                         $"+0x{slot.index * sizeof(ulong):X}=0x{slot.value:X}"));
         }
 
-        private static TableState ReadTable(
+        private static TableState ReadFlatTable(
             ulong world,
             ulong listOffset,
             ulong countOffset,
@@ -910,13 +930,43 @@ namespace MamboDMA.Games.DayZ
         {
             TryReadPointer(world + listOffset, out ulong pointer);
             if (!TryReadValue(world + countOffset, out int rawCount))
-                return new TableState(pointer, 0);
+                return new TableState(pointer, 0, 0);
 
             int count = Math.Clamp(rawCount, 0, maximumCount);
             if (count != 0 && !IsPlausiblePointer(pointer))
                 count = 0;
 
-            return new TableState(pointer, count);
+            return new TableState(pointer, count, count);
+        }
+
+        private static TableState ReadStructuredTable(
+            ulong world,
+            ulong listOffset,
+            ulong allocatedCountOffset,
+            ulong validCountOffset,
+            int maximumCount)
+        {
+            TryReadPointer(world + listOffset, out ulong pointer);
+
+            int allocatedCount = 0;
+            if (TryReadValue(world + allocatedCountOffset, out int rawAllocatedCount))
+                allocatedCount = Math.Clamp(rawAllocatedCount, 0, maximumCount);
+
+            int validCount = -1;
+            if (TryReadValue(world + validCountOffset, out int rawValidCount) &&
+                rawValidCount >= 0 &&
+                rawValidCount <= allocatedCount)
+            {
+                validCount = rawValidCount;
+            }
+
+            if (allocatedCount != 0 && !IsPlausiblePointer(pointer))
+            {
+                allocatedCount = 0;
+                validCount = 0;
+            }
+
+            return new TableState(pointer, allocatedCount, validCount);
         }
 
         public sealed class DayZCamera
@@ -1107,6 +1157,141 @@ namespace MamboDMA.Games.DayZ
 
                     if (entity.IsValid)
                         entities.Add(entity);
+                }
+
+                return entities;
+            }
+
+            public static List<Entity> EnumerateStructuredEntities(
+                string tableName,
+                ulong tablePointer,
+                int allocatedCount,
+                int candidateValidCount,
+                bool logSamples)
+            {
+                int expectedCount = candidateValidCount >= 0
+                    ? candidateValidCount
+                    : allocatedCount;
+                var entities = new List<Entity>(
+                    Math.Min(Math.Max(expectedCount, 0), 1_024));
+
+                if (!IsPlausiblePointer(tablePointer) || allocatedCount <= 0)
+                    return entities;
+
+                int requestedBytes;
+                try
+                {
+                    requestedBytes = checked(
+                        allocatedCount * DayZOffsets.StructuredEntityTable.EntryStride);
+                }
+                catch (OverflowException)
+                {
+                    MaybeLogError($"{tableName} structured table size", new InvalidOperationException(
+                        $"Allocated count {allocatedCount} overflows the table byte size."));
+                    return entities;
+                }
+
+                long readStart = logSamples ? Stopwatch.GetTimestamp() : 0;
+                byte[]? tableBytes;
+                try
+                {
+                    tableBytes = DmaMemory.ReadBytes(tablePointer, (uint)requestedBytes);
+                }
+                catch (Exception ex)
+                {
+                    MaybeLogError($"{tableName} structured table", ex);
+                    return entities;
+                }
+
+                if (tableBytes is null ||
+                    tableBytes.Length < DayZOffsets.StructuredEntityTable.EntryStride)
+                {
+                    return entities;
+                }
+
+                int availableEntries = Math.Min(
+                    allocatedCount,
+                    tableBytes.Length / DayZOffsets.StructuredEntityTable.EntryStride);
+                int activeEntries = 0;
+                int invalidPointers = 0;
+                int duplicatePointers = 0;
+                int invalidEntities = 0;
+                int loggedEntities = 0;
+                var seenPointers = new HashSet<ulong>();
+
+                // Scan the full allocated region until second-PC diagnostics confirm
+                // that the candidate +0x10 count always matches the active flags.
+                // Trusting an unverified count here could silently hide valid entries.
+                for (int index = 0; index < availableEntries; index++)
+                {
+                    int entryOffset =
+                        index * DayZOffsets.StructuredEntityTable.EntryStride;
+                    ReadOnlySpan<byte> entry = tableBytes.AsSpan(
+                        entryOffset,
+                        DayZOffsets.StructuredEntityTable.EntryStride);
+
+                    ushort flag = BinaryPrimitives.ReadUInt16LittleEndian(
+                        entry.Slice(DayZOffsets.StructuredEntityTable.ValidFlag, sizeof(ushort)));
+                    ulong entityPointer = BinaryPrimitives.ReadUInt64LittleEndian(
+                        entry.Slice(DayZOffsets.StructuredEntityTable.EntityPointer, sizeof(ulong)));
+                    ulong metadata = BinaryPrimitives.ReadUInt64LittleEndian(
+                        entry.Slice(DayZOffsets.StructuredEntityTable.Metadata, sizeof(ulong)));
+
+                    if (logSamples && index < DiagnosticSampleCount)
+                    {
+                        LogStructuredEntryDiagnostic(
+                            tableName,
+                            index,
+                            flag,
+                            entityPointer,
+                            metadata);
+                    }
+
+                    if (flag != DayZOffsets.StructuredEntityTable.ActiveFlag)
+                        continue;
+
+                    activeEntries++;
+                    if (!IsPlausiblePointer(entityPointer))
+                    {
+                        invalidPointers++;
+                        continue;
+                    }
+
+                    if (!seenPointers.Add(entityPointer))
+                    {
+                        duplicatePointers++;
+                        continue;
+                    }
+
+                    Entity entity = Parse(tableName, index, entityPointer);
+                    if (logSamples && loggedEntities++ < DiagnosticSampleCount)
+                        LogEntityDiagnostic(entity);
+
+                    if (entity.IsValid)
+                        entities.Add(entity);
+                    else
+                        invalidEntities++;
+                }
+
+                if (logSamples)
+                {
+                    string candidateCount = candidateValidCount >= 0
+                        ? candidateValidCount.ToString()
+                        : "unknown";
+                    string countValidation = candidateValidCount < 0
+                        ? "unverified"
+                        : candidateValidCount == activeEntries
+                            ? "match"
+                            : "mismatch";
+
+                    Logger.Info(
+                        $"[DayZ/Table] table={tableName} pointer=0x{tablePointer:X} " +
+                        $"allocated={allocatedCount} candidateValid={candidateCount} " +
+                        $"scanned={availableEntries} activeFlags={activeEntries} " +
+                        $"parsed={entities.Count} invalidPointers={invalidPointers} " +
+                        $"duplicates={duplicatePointers} invalidEntities={invalidEntities} " +
+                        $"countValidation={countValidation} bytes={tableBytes.Length} " +
+                        $"bulkRead={Stopwatch.GetElapsedTime(readStart).TotalMilliseconds:F2}ms");
                 }
 
                 return entities;
@@ -1412,9 +1597,14 @@ namespace MamboDMA.Games.DayZ
                 $"[DayZ/Diag] Near table=0x{snapshot.NearTable:X} count={snapshot.NearCount} | " +
                 $"Far table=0x{snapshot.FarTable:X} count={snapshot.FarCount}");
             Logger.Info(
-                $"[DayZ/Diag] Slow table=0x{snapshot.SlowTable:X} count={snapshot.SlowCount} | " +
-                $"Item table=0x{snapshot.ItemTable:X} count={snapshot.ItemCount}");
+                $"[DayZ/Diag] Slow table=0x{snapshot.SlowTable:X} " +
+                $"allocated={snapshot.SlowAllocatedCount} valid={FormatCandidateCount(snapshot.SlowCount)} | " +
+                $"Item table=0x{snapshot.ItemTable:X} " +
+                $"allocated={snapshot.ItemAllocatedCount} valid={FormatCandidateCount(snapshot.ItemCount)}");
         }
+
+        private static string FormatCandidateCount(int count)
+            => count >= 0 ? count.ToString() : "unknown";
 
         private static void LogEntityDiagnostic(Entity entity)
         {
@@ -1426,6 +1616,18 @@ namespace MamboDMA.Games.DayZ
                 $"position={FormatVector(entity.Position)} positionMode={entity.PositionReadMode} " +
                 $"networkId={entity.NetworkId} " +
                 $"validation=\"{entity.Validation}\"");
+        }
+
+        private static void LogStructuredEntryDiagnostic(
+            string tableName,
+            int index,
+            ushort flag,
+            ulong entityPointer,
+            ulong metadata)
+        {
+            Logger.Info(
+                $"[DayZ/TableEntry] table={tableName} index={index} " +
+                $"flag=0x{flag:X} entity=0x{entityPointer:X} metadata=0x{metadata:X}");
         }
 
         private static void TrackItems(IReadOnlyList<Entity> items, bool logSamples)
@@ -1559,7 +1761,10 @@ namespace MamboDMA.Games.DayZ
             Vector3 Position,
             string Resolution);
 
-        private readonly record struct TableState(ulong Pointer, int Count);
+        private readonly record struct TableState(
+            ulong Pointer,
+            int AllocatedCount,
+            int ValidCount);
 
         private sealed record ItemTrace(
             uint NetworkId,

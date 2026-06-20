@@ -31,8 +31,10 @@ namespace MamboDMA.Games.DayZ
             public const ulong FarTableSize = 0x1098;
             public const ulong SlowEntityList = 0x2010;
             public const ulong SlowTableSize = 0x2018;
+            public const ulong SlowTableValidSize = SlowEntityList + 0x10;
             public const ulong ItemList = 0x2060;
             public const ulong ItemListSize = 0x2068;
+            public const ulong ItemListValidSize = ItemList + 0x10;
 
             public const ulong LocalPlayer = 0x2960;
             public const ulong PlayerOn = 0x2968;
@@ -50,6 +52,21 @@ namespace MamboDMA.Games.DayZ
 
             // dump.log represents this signed displacement as 0xFFFFFFFFFFFFFF58.
             public const long LocalOffset = -0xA8;
+        }
+
+        /// <summary>
+        /// Slow and Item tables use sparse 0x18-byte slots rather than flat
+        /// pointer arrays. The +0x8 World fields are allocated capacities;
+        /// the candidate active counts are stored at +0x10.
+        /// </summary>
+        public static class StructuredEntityTable
+        {
+            public const int EntryStride = 0x18;
+            public const int ValidFlag = 0x0;
+            // Bytes 0x02..0x07 are currently unidentified padding.
+            public const int EntityPointer = 0x8;
+            public const int Metadata = 0x10;
+            public const ushort ActiveFlag = 1;
         }
 
         public static class Entity

@@ -79,9 +79,9 @@ namespace MamboDMA
             try { win.Run(drawLoop); }
             finally
             {
+                try { DayZUpdater.Stop(); } catch { }
                 try { VmmService.DisposeVmm(); } catch { }
                 try { JobSystem.Stop(); } catch { }
-                try { DayZUpdater.Stop(); } catch { }
             }
         }
     }

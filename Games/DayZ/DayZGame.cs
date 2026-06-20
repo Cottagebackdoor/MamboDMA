@@ -1,3 +1,5 @@
+#nullable enable
+
 using System.Numerics;
 using ImGuiNET;
 using MamboDMA.Services;
@@ -151,16 +153,34 @@ namespace MamboDMA.Games.DayZ
 
                 if (ImGui.CollapsingHeader("World / Manager", ImGuiTreeNodeFlags.DefaultOpen))
                 {
-                    ImGui.Text($"WorldPtr: 0x{DayZUpdater.WorldPtr:X}");
-                    ImGui.Text($"NetMgrPtr: 0x{DayZUpdater.NetMgrPtr:X}");
+                    ImGui.Text($"VMM ready: {snap.VmmReady}");
+                    ImGui.Text($"DMA attached: {snap.DmaAttached}");
+                    ImGui.Text($"World resolved: {snap.Attached}");
+                    ImGui.Text($"PID: {snap.ProcessId}");
+                    ImGui.Text($"Module base: 0x{snap.ModuleBase:X}");
+                    ImGui.Text($"World address: 0x{snap.WorldAddress:X}");
                     ImGui.Text($"World: 0x{snap.World:X}");
-                    ImGui.Text($"NetworkMgr: 0x{snap.NetworkManager:X}");
+                    ImGui.Text($"Network address: 0x{snap.NetworkAddress:X}");
+                    ImGui.Text($"Network: 0x{snap.Network:X}");
+                    ImGui.Text($"Network manager address: 0x{snap.NetworkManagerAddress:X}");
+                    ImGui.Text($"Network manager: 0x{snap.NetworkManager:X}");
+                    ImGui.Text($"Camera: 0x{snap.Camera:X}");
+                    ImGui.Text($"Local reference (World+0x2960): 0x{snap.LocalPlayerReference:X}");
+                    ImGui.Text($"Resolved local-player entity: 0x{snap.LocalPlayer:X}");
+                    ImGui.TextWrapped($"Resolution: {snap.LocalPlayerResolution}");
+                    ImGui.Text($"PlayerOn raw (+0x2968): 0x{snap.PlayerOn:X}");
+                    ImGui.Text($"Local position: {snap.LocalPlayerPosition}");
                 }
 
                 if (ImGui.CollapsingHeader("Camera", ImGuiTreeNodeFlags.DefaultOpen))
                 {
                     if (cam != null)
                     {
+                        ImGui.Text($"Pointer: 0x{cam.Pointer:X}");
+                        ImGui.Text($"ViewMatrix selector: 0x{cam.ViewMatrixSelector:X}");
+                        ImGui.Text($"Viewport: {cam.ViewportSize}");
+                        ImGui.Text($"Projection D1: {cam.ProjectionD1}");
+                        ImGui.Text($"Projection D2: {cam.ProjectionD2}");
                         ImGui.Text($"ViewTranslation: {cam.InvertedViewTranslation}");
                         ImGui.Text($"Forward: {cam.InvertedViewForward}");
                         ImGui.Text($"Right: {cam.InvertedViewRight}");
@@ -172,10 +192,10 @@ namespace MamboDMA.Games.DayZ
 
                 if (ImGui.CollapsingHeader("Entity Tables", ImGuiTreeNodeFlags.DefaultOpen))
                 {
-                    ImGui.Text($"Near: {snap.NearCount}");
-                    ImGui.Text($"Far: {snap.FarCount}");
-                    ImGui.Text($"Slow: {snap.SlowCount}");
-                    ImGui.Text($"Items: {snap.ItemCount}");
+                    ImGui.Text($"Near: 0x{snap.NearTable:X} ({snap.NearCount})");
+                    ImGui.Text($"Far: 0x{snap.FarTable:X} ({snap.FarCount})");
+                    ImGui.Text($"Slow: 0x{snap.SlowTable:X} ({snap.SlowCount})");
+                    ImGui.Text($"Items: 0x{snap.ItemTable:X} ({snap.ItemCount})");
                 }
 
                 if (ImGui.CollapsingHeader("Entities", ImGuiTreeNodeFlags.DefaultOpen))
@@ -204,7 +224,13 @@ namespace MamboDMA.Games.DayZ
                 if (ImGui.BeginChild($"{label}_Child", new Vector2(0, 300), ImGuiChildFlags.None))
                 {
                     foreach (var e in ents.Take(200))
-                        ImGui.Text($"0x{e.Ptr:X} | {e.CleanName} ({e.ConfigName}) pos=({e.Position.X:F1},{e.Position.Y:F1},{e.Position.Z:F1})");
+                    {
+                        ImGui.Text(
+                            $"{e.SourceTable}[{e.SourceIndex}] 0x{e.Ptr:X} net={e.NetworkId} | " +
+                            $"{e.DisplayName} ({e.ConfigName}) " +
+                            $"pos=({e.Position.X:F1},{e.Position.Y:F1},{e.Position.Z:F1}) " +
+                            $"[{e.Validation}]");
+                    }
                 }
                 ImGui.EndChild();
                 ImGui.EndTabItem();
@@ -222,7 +248,7 @@ namespace MamboDMA.Games.DayZ
             ImGui.TextDisabled(caption);
         }
 
-        private static void DrawDebugOverlay(Entity ent, DayZCamera cam, float maxDist)
+        private static void DrawDebugOverlay(Entity ent, DayZCamera? cam, float maxDist)
         {
             if (cam == null) return;
 
@@ -250,7 +276,7 @@ namespace MamboDMA.Games.DayZ
             DrawLine($"Pos: {ent.Position.X:F1}, {ent.Position.Y:F1}, {ent.Position.Z:F1}", green);
         }
 
-        private static void DrawBoxAround(Vector3 worldPos, Vector4 color, DayZUpdater.DayZCamera cam, float size = 20f)
+        private static void DrawBoxAround(Vector3 worldPos, Vector4 color, DayZUpdater.DayZCamera? cam, float size = 20f)
         {
             if (!DayZUpdater.WorldToScreenDayZ(cam, worldPos,
                     new Vector2(ScreenService.Current.W, ScreenService.Current.H), out var screenPos))

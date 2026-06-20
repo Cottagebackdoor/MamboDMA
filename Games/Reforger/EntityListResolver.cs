@@ -242,11 +242,10 @@ namespace ArmaReforgerFeeder
             int genericCount = 0;
             int validCount = 0;
             int invalidCount = 0;
+            var validIndices = new List<int>(entities.Length);
 
-            using (var scatter = DmaMemory.Scatter())
+            using (var scatter = DmaMemory.Scatter(useCache: true))
             {
-                var round = scatter.AddRound(useCache: true);
-                
                 for (int i = 0; i < entities.Length; i++)
                 {
                     if (!IsValidPointer(entities[i]))
@@ -255,39 +254,37 @@ namespace ArmaReforgerFeeder
                         continue;
                     }
 
-                    int idx = i;
-                    round[idx].AddValueEntry<ulong>(0, entities[i] + Off.PrefabMgr);
-                    
-                    round[idx].Completed += (_, cb) =>
-                    {
-                        if (!cb.TryGetValue<ulong>(0, out var prefabMgr) || prefabMgr == 0)
-                        {
-                            invalidCount++;
-                            return;
-                        }
-
-                        string typeStr = TryReadPrefabType(prefabMgr);
-                        
-                        if (string.IsNullOrEmpty(typeStr))
-                        {
-                            invalidCount++;
-                            return;
-                        }
-
-                        validCount++;
-
-                        if (IsCharacterEntity(typeStr))
-                            characterCount++;
-                        else if (IsVehicleEntity(typeStr))
-                            vehicleCount++;
-                        else if (IsItemEntity(typeStr))
-                            itemCount++;
-                        else if (IsGenericEntity(typeStr))
-                            genericCount++;
-                    };
+                    validIndices.Add(i);
+                    scatter.PrepareReadValue<ulong>(entities[i] + Off.PrefabMgr);
                 }
-                
+
                 scatter.Execute();
+
+                foreach (int i in validIndices)
+                {
+                    if (!scatter.ReadValue(entities[i] + Off.PrefabMgr, out ulong prefabMgr) || prefabMgr == 0)
+                    {
+                        invalidCount++;
+                        continue;
+                    }
+
+                    string typeStr = TryReadPrefabType(prefabMgr);
+                    if (string.IsNullOrEmpty(typeStr))
+                    {
+                        invalidCount++;
+                        continue;
+                    }
+
+                    validCount++;
+                    if (IsCharacterEntity(typeStr))
+                        characterCount++;
+                    else if (IsVehicleEntity(typeStr))
+                        vehicleCount++;
+                    else if (IsItemEntity(typeStr))
+                        itemCount++;
+                    else if (IsGenericEntity(typeStr))
+                        genericCount++;
+                }
             }
 
             int maxCount = Math.Max(Math.Max(characterCount, vehicleCount), Math.Max(itemCount, genericCount));

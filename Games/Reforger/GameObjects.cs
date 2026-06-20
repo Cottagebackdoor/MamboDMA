@@ -177,27 +177,27 @@ namespace ArmaReforgerFeeder
             var facComp = new ulong[ents.Length];
 
             // First scatter: positions and component pointers
-            using (var map = DmaMemory.Scatter())
+            using (var scatter = DmaMemory.Scatter())
             {
-                var rd = map.AddRound(useCache: false);
                 for (int i = 0; i < ents.Length; i++)
                 {
-                    int idx = i;
                     ulong e = ents[i];
                     if (e == 0) continue;
 
-                    rd[idx].AddValueEntry<Vector3f>(0, e + Off.EntityPosition);
-                    rd[idx].AddValueEntry<ulong>(1, e + Off.PrefabMgrVic);
-                    rd[idx].AddValueEntry<ulong>(2, e + Off.FactionComponent);
-                    
-                    rd[idx].Completed += (_, cb) =>
-                    {
-                        cb.TryGetValue<Vector3f>(0, out posTmp[idx]);
-                        cb.TryGetValue<ulong>(1, out prefab[idx]);
-                        cb.TryGetValue<ulong>(2, out facComp[idx]);
-                    };
+                    scatter.PrepareReadValue<Vector3f>(e + Off.EntityPosition);
+                    scatter.PrepareReadValue<ulong>(e + Off.PrefabMgrVic);
+                    scatter.PrepareReadValue<ulong>(e + Off.FactionComponent);
                 }
-                map.Execute();
+                scatter.Execute();
+
+                for (int i = 0; i < ents.Length; i++)
+                {
+                    ulong e = ents[i];
+                    if (e == 0) continue;
+                    scatter.ReadValue(e + Off.EntityPosition, out posTmp[i]);
+                    scatter.ReadValue(e + Off.PrefabMgrVic, out prefab[i]);
+                    scatter.ReadValue(e + Off.FactionComponent, out facComp[i]);
+                }
             }
 
             var outVehicles = new List<VehicleDto>(256);
@@ -258,25 +258,25 @@ namespace ArmaReforgerFeeder
             var posTmp = new Vector3f[ents.Length];
             var prefab = new ulong[ents.Length];
 
-            using (var map = DmaMemory.Scatter())
+            using (var scatter = DmaMemory.Scatter())
             {
-                var rd = map.AddRound(useCache: false);
                 for (int i = 0; i < ents.Length; i++)
                 {
-                    int idx = i;
                     ulong e = ents[i];
                     if (e == 0) continue;
 
-                    rd[idx].AddValueEntry<Vector3f>(0, e + Off.EntityPosition);
-                    rd[idx].AddValueEntry<ulong>(1, e + Off.PrefabMgrVic);
-                    
-                    rd[idx].Completed += (_, cb) =>
-                    {
-                        cb.TryGetValue<Vector3f>(0, out posTmp[idx]);
-                        cb.TryGetValue<ulong>(1, out prefab[idx]);
-                    };
+                    scatter.PrepareReadValue<Vector3f>(e + Off.EntityPosition);
+                    scatter.PrepareReadValue<ulong>(e + Off.PrefabMgrVic);
                 }
-                map.Execute();
+                scatter.Execute();
+
+                for (int i = 0; i < ents.Length; i++)
+                {
+                    ulong e = ents[i];
+                    if (e == 0) continue;
+                    scatter.ReadValue(e + Off.EntityPosition, out posTmp[i]);
+                    scatter.ReadValue(e + Off.PrefabMgrVic, out prefab[i]);
+                }
             }
 
             var outList = new List<ItemDto>(512);
@@ -327,20 +327,23 @@ namespace ArmaReforgerFeeder
             var ents = new ulong[take];
             double stride = (double)count / take;
 
-            using var samp = DmaMemory.Scatter();
-            var r = samp.AddRound(useCache: false);
+            using var scatter = DmaMemory.Scatter();
             
             for (int i = 0; i < take; i++)
             {
                 int srcIndex = (int)(i * stride);
                 if (srcIndex >= count) srcIndex = count - 1;
                 
-                int idx = i;
-                r[idx].AddValueEntry<ulong>(0, list + (ulong)(srcIndex * 8));
-                r[idx].Completed += (_, cb) => cb.TryGetValue<ulong>(0, out ents[idx]);
+                scatter.PrepareReadValue<ulong>(list + (ulong)(srcIndex * 8));
             }
-            
-            samp.Execute();
+
+            scatter.Execute();
+            for (int i = 0; i < take; i++)
+            {
+                int srcIndex = (int)(i * stride);
+                if (srcIndex >= count) srcIndex = count - 1;
+                scatter.ReadValue(list + (ulong)(srcIndex * 8), out ents[i]);
+            }
             return ents;
         }
 

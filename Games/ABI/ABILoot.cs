@@ -14,15 +14,14 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using MamboDMA.Services;
-using VmmSharpEx.Scatter.V2;
 
 namespace MamboDMA.Games.ABI
 {
     public static class ABILoot
     {
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Debug structures
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         public enum LabelSource : byte { None, Common_DisplayName, Common_SimpleName, Fallback_ClassName }
         public enum PriceSource : byte { None, Common_StandardPrice, Provider_ClassName }
 
@@ -57,9 +56,9 @@ namespace MamboDMA.Games.ABI
             public int LabelsFromCommon;
         }
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Public data model
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         public struct Item
         {
             public ulong   Actor;
@@ -100,9 +99,9 @@ namespace MamboDMA.Games.ABI
 
         public interface IPriceProvider { int TryGetPrice(string className); }
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Confirmed offsets from SDK
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         internal static class InvCommonOffsets
         {
             public const int OFF_StandardPrice  = 0x010C;
@@ -134,9 +133,9 @@ namespace MamboDMA.Games.ABI
         private const int OFF_INVBASE_CHILD_ACTORS = 0x10;
         private const int SIZEOF_INVBASE = 0x48;
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Controls
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         public static int  UpdateIntervalMs { get => _intervalMs; set => _intervalMs = Math.Clamp(value, 16, 500); }
         public static bool IsRunning => _running;
         public static void SetPriceProvider(IPriceProvider provider) => _priceProvider = provider;
@@ -167,9 +166,9 @@ namespace MamboDMA.Games.ABI
             lock (_sync) return _dbg;
         }
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Internal state
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         private static volatile bool _running;
         private static Thread _thread;
         private static readonly object _sync = new();
@@ -203,9 +202,9 @@ namespace MamboDMA.Games.ABI
             "BP_BackPackBase_C", "BP_TacRigBase_C", "BP_PouchBase_C",
         };
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Main loop
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         private static void Loop()
         {
             var sw = new System.Diagnostics.Stopwatch();
@@ -233,16 +232,15 @@ namespace MamboDMA.Games.ABI
             var ptrs = DmaMemory.ReadArray<ulong>(actorArray, take);
             if (ptrs == null || ptrs.Length == 0) { PublishEmpty(actorCount); return; }
 
-            using var map = DmaMemory.Scatter();
-            var rd = map.AddRound(false);
+            using var scatter = DmaMemory.Scatter();
 
             for (int i = 0; i < ptrs.Length; i++)
             {
                 ulong a = ptrs[i]; if (a == 0) continue;
-                rd[i].AddValueEntry<uint>(0, a + 24);
-                rd[i].AddValueEntry<ulong>(1, a + LootSceneOffsets.AActor_RootComponent);
+                scatter.PrepareReadValue<uint>(a + 24);
+                scatter.PrepareReadValue<ulong>(a + LootSceneOffsets.AActor_RootComponent);
             }
-            map.Execute();
+            scatter.Execute();
 
             var items = new List<Item>(256);
             var containerActors = new List<ulong>(64);
@@ -256,7 +254,7 @@ namespace MamboDMA.Games.ABI
             for (int i = 0; i < ptrs.Length; i++)
             {
                 ulong a = ptrs[i]; if (a == 0) continue;
-                if (!rd[i].TryGetValue(0, out uint fname) || fname == 0) continue;
+                if (!scatter.ReadValue(a + 24, out uint fname) || fname == 0) continue;
                 string cls = ABINamePool.GetName(fname);
                 if (string.IsNullOrEmpty(cls)) continue;
 
@@ -267,7 +265,8 @@ namespace MamboDMA.Games.ABI
 
                 if (IsContainer(cls))
                 {
-                    Vector3 pos = ReadActorWorldPosFromRoot(rd[i].TryGetValue(1, out ulong root) ? root : 0);
+                    Vector3 pos = ReadActorWorldPosFromRoot(
+                        scatter.ReadValue(a + LootSceneOffsets.AActor_RootComponent, out ulong root) ? root : 0);
 
                     // Try container-specific offset
                     string label = null; int price = 0; int rarity = 0;
@@ -301,7 +300,7 @@ namespace MamboDMA.Games.ABI
 
                 if (IsItem(cls))
                 {
-                    Vector3 pos = ReadActorWorldPosForItem(a, rd[i].TryGetValue(1, out ulong root) ? root : 0);
+                    Vector3 pos = ReadActorWorldPosForItem(a, scatter.ReadValue(a + LootSceneOffsets.AActor_RootComponent, out ulong root) ? root : 0);
 
                     // Try item-specific offset
                     string label = null; int price = 0; int rarity = 0;
@@ -407,9 +406,9 @@ namespace MamboDMA.Games.ABI
             }
         }
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // CRITICAL FIX: Proper FText reading
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         private static string ReadFTextString(ulong baseAddr, int relOff)
         {
             try
@@ -647,9 +646,9 @@ namespace MamboDMA.Games.ABI
             }
         }
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Classification helpers
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         private static bool IsContainer(string cls)
         {
             if (LootContainerClassHints.Contains(cls)) return true;
@@ -672,9 +671,9 @@ namespace MamboDMA.Games.ABI
             return false;
         }
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Container expansion (same as before but with proper metadata)
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         private static bool ExpandContainer(ulong boxActor, List<Item> outList, out ContainerDebug cdbg)
         {
             cdbg = new ContainerDebug
@@ -713,38 +712,37 @@ namespace MamboDMA.Games.ABI
                             int count = Math.Min(baseList.Count, 128);
                             int childOffset = OFF_INVBASE_CHILD_ACTORS;
 
-                            using var map = DmaMemory.Scatter();
-                            var r = map.AddRound(false);
+                            using var childScatter = DmaMemory.Scatter();
 
                             for (int i = 0; i < count; i++)
                             {
                                 ulong elem = baseList.Data + (ulong)(i * SIZEOF_INVBASE);
-                                r[i].AddValueEntry<ulong>(0, elem + (ulong)childOffset + 0x00);
-                                r[i].AddValueEntry<int>(1, elem + (ulong)childOffset + 0x08);
+                                childScatter.PrepareReadValue<ulong>(elem + (ulong)childOffset + 0x00);
+                                childScatter.PrepareReadValue<int>(elem + (ulong)childOffset + 0x08);
                             }
-                            map.Execute();
+                            childScatter.Execute();
 
                             for (int i = 0; i < count; i++)
                             {
-                                if (!r[i].TryGetValue(0, out ulong data) || data == 0) continue;
-                                if (!r[i].TryGetValue(1, out int c) || c <= 0 || c > 512) continue;
+                                ulong elem = baseList.Data + (ulong)(i * SIZEOF_INVBASE);
+                                if (!childScatter.ReadValue(elem + (ulong)childOffset + 0x00, out ulong data) || data == 0) continue;
+                                if (!childScatter.ReadValue(elem + (ulong)childOffset + 0x08, out int c) || c <= 0 || c > 512) continue;
 
                                 var kids = DmaMemory.ReadArray<ulong>(data, c);
                                 if (kids == null || kids.Length == 0) continue;
 
-                                using var map2 = DmaMemory.Scatter();
-                                var r2 = map2.AddRound(false);
+                                using var actorScatter = DmaMemory.Scatter();
                                 for (int k = 0; k < kids.Length; k++)
                                 {
                                     ulong a = kids[k]; if (a == 0) continue;
-                                    r2[k].AddValueEntry<uint>(0, a + 24);
+                                    actorScatter.PrepareReadValue<uint>(a + 24);
                                 }
-                                map2.Execute();
+                                actorScatter.Execute();
 
                                 for (int k = 0; k < kids.Length; k++)
                                 {
                                     ulong a = kids[k]; if (a == 0) continue;
-                                    string cls = r2[k].TryGetValue(0, out uint fname) ? ABINamePool.GetName(fname) : null;
+                                    string cls = actorScatter.ReadValue(a + 24, out uint fname) ? ABINamePool.GetName(fname) : null;
                                     if (string.IsNullOrEmpty(cls) || !IsItem(cls)) continue;
 
                                     // Skip character actors here too
@@ -817,9 +815,9 @@ namespace MamboDMA.Games.ABI
             return 0;
         }
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Position helpers - FIXED: Store raw world positions
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         private static Vector3 ReadActorWorldPos(ulong actor)
         {
             if (actor == 0) return default;
@@ -868,9 +866,9 @@ namespace MamboDMA.Games.ABI
             return t.Translation;
         }
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         // Small helpers
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // -----------------------------------------------------------------------------
         private readonly struct TArrayHdr
         {
             public readonly ulong Data;

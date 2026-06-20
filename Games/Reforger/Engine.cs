@@ -177,37 +177,29 @@ namespace ArmaReforgerFeeder
             Vector3f pos = default, invR = default, invU = default, fwd = default, zf = default;
             bool okFov = false, okPose = false;
 
-            using var map = DmaMemory.Scatter();
-            var rd = map.AddRound(useCache: false);
+            using var scatter = DmaMemory.Scatter();
+            scatter.PrepareReadValue<float>(_camMgr + Off.FirstPersonFOV);
+            scatter.PrepareReadValue<float>(_camMgr + Off.ThirdPersonFOV);
+            scatter.PrepareReadValue<Vector3f>(_playerCam + Off.CameraPos);
+            scatter.PrepareReadValue<Vector3f>(_playerCam + Off.InvertedViewRight);
+            scatter.PrepareReadValue<Vector3f>(_playerCam + Off.InvertedViewUp);
+            scatter.PrepareReadValue<Vector3f>(_playerCam + Off.VectorViewForward);
+            scatter.PrepareReadValue<int>(_playerCam + Off.CameraViewType);
+            scatter.PrepareReadValue<float>(_playerCam + Off.CameraZoom);
+            scatter.PrepareReadValue<Vector3f>(_playerCam + Off.ZoomIncreaseFactor);
+            scatter.PrepareReadValue<int>(_camMgr + Off.PipActiveFlag);
+            scatter.Execute();
 
-            rd[0].AddValueEntry<float>(0, _camMgr + Off.FirstPersonFOV);
-            rd[0].AddValueEntry<float>(1, _camMgr + Off.ThirdPersonFOV);
-            rd[0].AddValueEntry<Vector3f>(2, _playerCam + Off.CameraPos);
-            rd[0].AddValueEntry<Vector3f>(3, _playerCam + Off.InvertedViewRight);
-            rd[0].AddValueEntry<Vector3f>(4, _playerCam + Off.InvertedViewUp);
-            rd[0].AddValueEntry<Vector3f>(5, _playerCam + Off.VectorViewForward);
-            rd[0].AddValueEntry<int>(6, _playerCam + Off.CameraViewType);
-            rd[0].AddValueEntry<float>(7, _playerCam + Off.CameraZoom);
-            rd[0].AddValueEntry<Vector3f>(8, _playerCam + Off.ZoomIncreaseFactor);
-            rd[0].AddValueEntry<int>(9, _camMgr + Off.PipActiveFlag);
-
-            rd[0].Completed += (_, cb) =>
-            {
-                okFov = cb.TryGetValue<float>(0, out f1) &&
-                        cb.TryGetValue<float>(1, out f3);
-
-                okPose = cb.TryGetValue<Vector3f>(2, out pos) &&
-                         cb.TryGetValue<Vector3f>(3, out invR) &&
-                         cb.TryGetValue<Vector3f>(4, out invU) &&
-                         cb.TryGetValue<Vector3f>(5, out fwd) &&
-                         cb.TryGetValue<int>(6, out vtype) &&
-                         cb.TryGetValue<float>(7, out zoom) &&
-                         cb.TryGetValue<Vector3f>(8, out zf);
-
-                cb.TryGetValue<int>(9, out pipFlag);
-            };
-
-            map.Execute();
+            okFov = scatter.ReadValue(_camMgr + Off.FirstPersonFOV, out f1) &&
+                    scatter.ReadValue(_camMgr + Off.ThirdPersonFOV, out f3);
+            okPose = scatter.ReadValue(_playerCam + Off.CameraPos, out pos) &&
+                     scatter.ReadValue(_playerCam + Off.InvertedViewRight, out invR) &&
+                     scatter.ReadValue(_playerCam + Off.InvertedViewUp, out invU) &&
+                     scatter.ReadValue(_playerCam + Off.VectorViewForward, out fwd) &&
+                     scatter.ReadValue(_playerCam + Off.CameraViewType, out vtype) &&
+                     scatter.ReadValue(_playerCam + Off.CameraZoom, out zoom) &&
+                     scatter.ReadValue(_playerCam + Off.ZoomIncreaseFactor, out zf);
+            scatter.ReadValue(_camMgr + Off.PipActiveFlag, out pipFlag);
             if (!(okFov && okPose)) return false;
 
             // Prepare values

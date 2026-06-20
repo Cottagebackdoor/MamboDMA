@@ -291,18 +291,21 @@ namespace ArmaReforgerFeeder
                 if (ents.Length == 0) { ExchangeMeta(MetaSnapshot.Empty); goto SleepSlow; }
 
                 var posTmp = new Vector3f[ents.Length];
-                using (var mPos = DmaMemory.Scatter())
+                using (var scatter = DmaMemory.Scatter())
                 {
-                    var r = mPos.AddRound(false);
                     for (int i = 0; i < ents.Length; i++)
                     {
                         ulong e = ents[i];
                         if (e == 0) continue;
-                        int idx = i;
-                        r[idx].AddValueEntry<Vector3f>(0, e + Off.EntityPosition);
-                        r[idx].Completed += (_, cb) => cb.TryGetValue<Vector3f>(0, out posTmp[idx]);
+                        scatter.PrepareReadValue<Vector3f>(e + Off.EntityPosition);
                     }
-                    mPos.Execute();
+                    scatter.Execute();
+                    for (int i = 0; i < ents.Length; i++)
+                    {
+                        ulong e = ents[i];
+                        if (e != 0)
+                            scatter.ReadValue(e + Off.EntityPosition, out posTmp[i]);
+                    }
                 }
 
                 var keep = new List<int>(ents.Length);
@@ -334,106 +337,108 @@ namespace ArmaReforgerFeeder
                 var extMgr = new ulong[keep.Count];
                 var isDeadB = new bool[keep.Count];
 
-                using (var mapB = DmaMemory.Scatter())
+                using (var scatter = DmaMemory.Scatter())
                 {
-                    var r = mapB.AddRound(false);
                     for (int k = 0; k < keep.Count; k++)
                     {
-                        int idx = k;
                         ulong e = ents[keep[k]];
-                        r[idx].AddValueEntry<ulong>(0, e + Off.PrefabMgr);
-                        r[idx].AddValueEntry<ulong>(1, e + Off.FactionComponent);
-                        r[idx].AddValueEntry<ulong>(2, e + Off.ExtDamageMgr);
-                        r[idx].AddValueEntry<ulong>(3, e + Off.CharacterAnimationComponent);
-                        r[idx].AddValueEntry<ulong>(4, e + Off.ExtDamageMgr);
-
-                        r[idx].Completed += (_, cb) =>
-                        {
-                            cb.TryGetValue<ulong>(0, out prefabMgr[idx]);
-                            cb.TryGetValue<ulong>(1, out factionComp[idx]);
-                            cb.TryGetValue<ulong>(3, out animComp[idx]);
-
-                            if (cb.TryGetValue<ulong>(4, out var ext) && ext != 0)
-                            {
-                                extMgr[idx] = ext;
-                                DmaMemory.Read(ext + Off.HitZone, out hitZone[idx]);
-                            }
-
-                            if (hitZone[idx] != 0 && DmaMemory.Read(hitZone[idx] + Off.Isdead, out byte db))
-                                isDeadB[idx] = db != 0;
-                        };
+                        scatter.PrepareReadValue<ulong>(e + Off.PrefabMgr);
+                        scatter.PrepareReadValue<ulong>(e + Off.FactionComponent);
+                        scatter.PrepareReadValue<ulong>(e + Off.ExtDamageMgr);
+                        scatter.PrepareReadValue<ulong>(e + Off.CharacterAnimationComponent);
                     }
-                    mapB.Execute();
+                    scatter.Execute();
+
+                    for (int k = 0; k < keep.Count; k++)
+                    {
+                        ulong e = ents[keep[k]];
+                        scatter.ReadValue(e + Off.PrefabMgr, out prefabMgr[k]);
+                        scatter.ReadValue(e + Off.FactionComponent, out factionComp[k]);
+                        scatter.ReadValue(e + Off.CharacterAnimationComponent, out animComp[k]);
+
+                        if (scatter.ReadValue(e + Off.ExtDamageMgr, out ulong ext) && ext != 0)
+                        {
+                            extMgr[k] = ext;
+                            DmaMemory.Read(ext + Off.HitZone, out hitZone[k]);
+                        }
+
+                        if (hitZone[k] != 0 && DmaMemory.Read(hitZone[k] + Off.Isdead, out byte db))
+                            isDeadB[k] = db != 0;
+                    }
                 }
 
                 var types = new string[keep.Count];
                 var typePtr = new ulong[keep.Count];
                 {
-                    using (var m1 = DmaMemory.Scatter())
+                    using (var scatter = DmaMemory.Scatter())
                     {
-                        var r = m1.AddRound(false);
                         for (int k = 0; k < keep.Count; k++)
                         {
                             if (prefabMgr[k] == 0) continue;
-                            int idx = k;
-                            r[idx].AddValueEntry<ulong>(0, prefabMgr[idx] + Off.PrefabDataClass);
-                            r[idx].Completed += (_, cb) =>
-                            {
-                                if (cb.TryGetValue<ulong>(0, out var cls) && cls != 0)
-                                {
-                                    typeClass[idx] = cls;
-                                    DmaMemory.Read(cls + Off.PrefabDataType, out typePtr[idx]);
-                                }
-                            };
+                            scatter.PrepareReadValue<ulong>(prefabMgr[k] + Off.PrefabDataClass);
                         }
-                        m1.Execute();
+                        scatter.Execute();
+                        for (int k = 0; k < keep.Count; k++)
+                        {
+                            if (prefabMgr[k] == 0) continue;
+                            if (scatter.ReadValue(prefabMgr[k] + Off.PrefabDataClass, out ulong cls) && cls != 0)
+                            {
+                                typeClass[k] = cls;
+                                DmaMemory.Read(cls + Off.PrefabDataType, out typePtr[k]);
+                            }
+                        }
                     }
 
-                    using (var m2 = DmaMemory.Scatter())
+                    using (var scatter = DmaMemory.Scatter(useCache: true))
                     {
-                        var r = m2.AddRound();
                         for (int k = 0; k < keep.Count; k++)
                         {
                             if (typePtr[k] == 0) continue;
-                            int idx = k;
-                            r[idx].AddStringEntry(0, typePtr[idx], TypeStringMax, Encoding.ASCII);
-                            r[idx].Completed += (_, cb) => cb.TryGetString(0, out types[idx]);
+                            scatter.PrepareRead(typePtr[k], (uint)TypeStringMax);
                         }
-                        m2.Execute();
+                        scatter.Execute();
+                        for (int k = 0; k < keep.Count; k++)
+                        {
+                            if (typePtr[k] != 0)
+                                types[k] = scatter.ReadString(typePtr[k], TypeStringMax, Encoding.ASCII);
+                        }
                     }
                 }
 
                 var factions = new string[keep.Count];
                 {
                     var ftypePtr = new ulong[keep.Count];
-                    using (var m1 = DmaMemory.Scatter())
+                    using (var scatter = DmaMemory.Scatter(useCache: true))
                     {
-                        var r = m1.AddRound();
                         for (int k = 0; k < keep.Count; k++)
                         {
                             if (factionComp[k] == 0) continue;
-                            int idx = k;
-                            r[idx].AddValueEntry<ulong>(0, factionComp[idx] + Off.FactionComponentDataClass);
-                            r[idx].Completed += (_, cb) =>
-                            {
-                                if (cb.TryGetValue<ulong>(0, out var fcls) && fcls != 0)
-                                    DmaMemory.Read(fcls + Off.FactionComponentDataType, out ftypePtr[idx]);
-                            };
+                            scatter.PrepareReadValue<ulong>(factionComp[k] + Off.FactionComponentDataClass);
                         }
-                        m1.Execute();
+                        scatter.Execute();
+                        for (int k = 0; k < keep.Count; k++)
+                        {
+                            if (factionComp[k] == 0) continue;
+                            if (scatter.ReadValue(factionComp[k] + Off.FactionComponentDataClass, out ulong fcls) && fcls != 0)
+                            {
+                                DmaMemory.Read(fcls + Off.FactionComponentDataType, out ftypePtr[k]);
+                            }
+                        }
                     }
 
-                    using (var m2 = DmaMemory.Scatter())
+                    using (var scatter = DmaMemory.Scatter(useCache: true))
                     {
-                        var r = m2.AddRound();
                         for (int k = 0; k < keep.Count; k++)
                         {
                             if (ftypePtr[k] == 0) continue;
-                            int idx = k;
-                            r[idx].AddStringEntry(0, ftypePtr[idx], FactionStringMax, Encoding.ASCII);
-                            r[idx].Completed += (_, cb) => cb.TryGetString(0, out factions[idx]);
+                            scatter.PrepareRead(ftypePtr[k], (uint)FactionStringMax);
                         }
-                        m2.Execute();
+                        scatter.Execute();
+                        for (int k = 0; k < keep.Count; k++)
+                        {
+                            if (ftypePtr[k] != 0)
+                                factions[k] = scatter.ReadString(ftypePtr[k], FactionStringMax, Encoding.ASCII);
+                        }
                     }
                 }
 
@@ -571,23 +576,23 @@ namespace ArmaReforgerFeeder
                 int n = meta.Count;
                 if (n > 0)
                 {
-                    using var map = DmaMemory.Scatter();
-                    var rd = map.AddRound(useCache: true);
+                    using var scatter = DmaMemory.Scatter(useCache: true);
                     for (int i = 0; i < n; i++)
                     {
                         if (i >= meta.HitZone.Length) break;
                         ulong hz = meta.HitZone[i];
                         if (hz == 0) continue;
-                        int idx = i;
-                        rd[idx].AddValueEntry<float>(0, hz + Off.HitZoneHP);
-                        rd[idx].AddValueEntry<byte>(1, hz + Off.Isdead);
-                        rd[idx].Completed += (_, cb) =>
-                        {
-                            if (cb.TryGetValue<float>(0, out float hp)) _hp[meta.Ents[idx]] = hp;
-                            if (cb.TryGetValue<byte>(1, out byte deadB)) _dead[meta.Ents[idx]] = deadB != 0;
-                        };
+                        scatter.PrepareReadValue<float>(hz + Off.HitZoneHP);
+                        scatter.PrepareReadValue<byte>(hz + Off.Isdead);
                     }
-                    map.Execute();
+                    scatter.Execute();
+                    for (int i = 0; i < n && i < meta.HitZone.Length; i++)
+                    {
+                        ulong hz = meta.HitZone[i];
+                        if (hz == 0) continue;
+                        if (scatter.ReadValue(hz + Off.HitZoneHP, out float hp)) _hp[meta.Ents[i]] = hp;
+                        if (scatter.ReadValue(hz + Off.Isdead, out byte deadB)) _dead[meta.Ents[i]] = deadB != 0;
+                    }
                 }
                 var spent = (int)sw.ElapsedMilliseconds;
                 if (spent < HpIntervalMs) Thread.Sleep(HpIntervalMs - spent);
@@ -614,16 +619,13 @@ namespace ArmaReforgerFeeder
 
                 int cap = Math.Min(n, FrameCap);
                 var em = new Matrix3x4[cap];
-                using (var m0 = DmaMemory.Scatter())
+                using (var scatter = DmaMemory.Scatter())
                 {
-                    var r = m0.AddRound(useCache: false);
                     for (int i = 0; i < cap; i++)
-                    {
-                        int idx = i;
-                        r[idx].AddValueEntry<Matrix3x4>(0, meta.Ents[i] + Off.EntityMatrix);
-                        r[idx].Completed += (_, cb) => cb.TryGetValue<Matrix3x4>(0, out em[idx]);
-                    }
-                    m0.Execute();
+                        scatter.PrepareReadValue<Matrix3x4>(meta.Ents[i] + Off.EntityMatrix);
+                    scatter.Execute();
+                    for (int i = 0; i < cap; i++)
+                        scatter.ReadValue(meta.Ents[i] + Off.EntityMatrix, out em[i]);
                 }
 
                 var headIdx = new int[cap]; var neckIdx = new int[cap]; var spineIdx = new int[cap]; var hipIdx = new int[cap];
@@ -639,49 +641,49 @@ namespace ArmaReforgerFeeder
                     bonesPtr[i] = 0; animPtr[i] = 0;
                 }
 
-                using (var m1 = DmaMemory.Scatter())
+                using (var scatter = DmaMemory.Scatter(useCache: true))
                 {
-                    var r = m1.AddRound(useCache: true);
                     for (int i = 0; i < cap; i++)
                     {
-                        int idx = i; ulong ent = meta.Ents[i];
-                        r[idx].AddValueEntry<ulong>(0, ent + Off.MeshComponent);
-                        r[idx].AddValueEntry<ulong>(1, ent + Off.CharacterAnimationComponent);
-                        r[idx].Completed += (_, cb) =>
-                        {
-                            if (cb.TryGetValue<ulong>(0, out ulong mc) && mc != 0)
-                                DmaMemory.Read(mc + Off.MeshComponentBones, out bonesPtr[idx]);
-                            var model = (idx < meta.Types.Length) ? meta.Types[idx] : string.Empty;
-                            if (Bones.EnsureIndicesForModel(ent, model, out var map6) && map6.Length > 0)
-                            {
-                                headIdx[idx] = map6[0];
-                                neckIdx[idx] = (map6.Length > 1) ? map6[1] : -1;
-                                spineIdx[idx] = (map6.Length > 2) ? map6[2] : -1;
-                                hipIdx[idx] = (map6.Length > 3) ? map6[3] : -1;
-                                lFootIdx[idx] = (map6.Length > 4) ? map6[4] : -1;
-                                rFootIdx[idx] = (map6.Length > 5) ? map6[5] : -1;
-                            }
-                            if ((SkeletonLevel == SkeletonDetail.Lite10 || SkeletonLevel == SkeletonDetail.Baller14) &&
-                                Bones.EnsureIndicesForModelVariant(ent, model, true, out var map16) && map16.Length >= 16)
-                            {
-                                if (map16[1] >= 0) neckIdx[idx] = map16[1];
-                                if (map16[2] >= 0) spineIdx[idx] = map16[2];
-                                if (SkeletonLevel == SkeletonDetail.Lite10)
-                                {
-                                    lHandIdx[idx] = map16[6]; rHandIdx[idx] = map16[9];
-                                    lKneeIdx[idx] = map16[11]; rKneeIdx[idx] = map16[14];
-                                }
-                                else
-                                {
-                                    lShoulderIdx[idx] = map16[4]; lElbowIdx[idx] = map16[5]; lHandIdx[idx] = map16[6];
-                                    rShoulderIdx[idx] = map16[7]; rElbowIdx[idx] = map16[8]; rHandIdx[idx] = map16[9];
-                                    lKneeIdx[idx] = map16[11]; rKneeIdx[idx] = map16[14];
-                                }
-                            }
-                            cb.TryGetValue<ulong>(1, out animPtr[idx]);
-                        };
+                        ulong ent = meta.Ents[i];
+                        scatter.PrepareReadValue<ulong>(ent + Off.MeshComponent);
+                        scatter.PrepareReadValue<ulong>(ent + Off.CharacterAnimationComponent);
                     }
-                    m1.Execute();
+                    scatter.Execute();
+                    for (int i = 0; i < cap; i++)
+                    {
+                        ulong ent = meta.Ents[i];
+                        if (scatter.ReadValue(ent + Off.MeshComponent, out ulong mc) && mc != 0)
+                            DmaMemory.Read(mc + Off.MeshComponentBones, out bonesPtr[i]);
+                        var model = (i < meta.Types.Length) ? meta.Types[i] : string.Empty;
+                        if (Bones.EnsureIndicesForModel(ent, model, out var map6) && map6.Length > 0)
+                        {
+                            headIdx[i] = map6[0];
+                            neckIdx[i] = (map6.Length > 1) ? map6[1] : -1;
+                            spineIdx[i] = (map6.Length > 2) ? map6[2] : -1;
+                            hipIdx[i] = (map6.Length > 3) ? map6[3] : -1;
+                            lFootIdx[i] = (map6.Length > 4) ? map6[4] : -1;
+                            rFootIdx[i] = (map6.Length > 5) ? map6[5] : -1;
+                        }
+                        if ((SkeletonLevel == SkeletonDetail.Lite10 || SkeletonLevel == SkeletonDetail.Baller14) &&
+                            Bones.EnsureIndicesForModelVariant(ent, model, true, out var map16) && map16.Length >= 16)
+                        {
+                            if (map16[1] >= 0) neckIdx[i] = map16[1];
+                            if (map16[2] >= 0) spineIdx[i] = map16[2];
+                            if (SkeletonLevel == SkeletonDetail.Lite10)
+                            {
+                                lHandIdx[i] = map16[6]; rHandIdx[i] = map16[9];
+                                lKneeIdx[i] = map16[11]; rKneeIdx[i] = map16[14];
+                            }
+                            else
+                            {
+                                lShoulderIdx[i] = map16[4]; lElbowIdx[i] = map16[5]; lHandIdx[i] = map16[6];
+                                rShoulderIdx[i] = map16[7]; rElbowIdx[i] = map16[8]; rHandIdx[i] = map16[9];
+                                lKneeIdx[i] = map16[11]; rKneeIdx[i] = map16[14];
+                            }
+                        }
+                        scatter.ReadValue(ent + Off.CharacterAnimationComponent, out animPtr[i]);
+                    }
                 }
 
                 var headMat = new Matrix3x4[cap]; var neckMat = new Matrix3x4[cap]; var spineMat = new Matrix3x4[cap];
@@ -690,53 +692,71 @@ namespace ArmaReforgerFeeder
                 var rKneeMat = new Matrix3x4[cap]; var lShoulderMat = new Matrix3x4[cap]; var rShoulderMat = new Matrix3x4[cap];
                 var lElbowMat = new Matrix3x4[cap]; var rElbowMat = new Matrix3x4[cap]; var stanceA = new EntityStance[cap];
 
-                using (var m2 = DmaMemory.Scatter())
+                using (var scatter = DmaMemory.Scatter())
                 {
-                    var r = m2.AddRound(useCache: false);
                     for (int i = 0; i < cap; i++)
                     {
-                        if (headIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(0, bonesPtr[i] + (ulong)headIdx[i] * Off.MeshComponentBonesMatrixSize);
-                        if (hipIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(2, bonesPtr[i] + (ulong)hipIdx[i] * Off.MeshComponentBonesMatrixSize);
-                        if (lFootIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(3, bonesPtr[i] + (ulong)lFootIdx[i] * Off.MeshComponentBonesMatrixSize);
-                        if (rFootIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(4, bonesPtr[i] + (ulong)rFootIdx[i] * Off.MeshComponentBonesMatrixSize);
-                        if (neckIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(5, bonesPtr[i] + (ulong)neckIdx[i] * Off.MeshComponentBonesMatrixSize);
-                        if (spineIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(6, bonesPtr[i] + (ulong)spineIdx[i] * Off.MeshComponentBonesMatrixSize);
+                        if (headIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], headIdx[i]));
+                        if (hipIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], hipIdx[i]));
+                        if (lFootIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], lFootIdx[i]));
+                        if (rFootIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], rFootIdx[i]));
+                        if (neckIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], neckIdx[i]));
+                        if (spineIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], spineIdx[i]));
                         if (SkeletonLevel == SkeletonDetail.Lite10)
                         {
-                            if (lHandIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(7, bonesPtr[i] + (ulong)lHandIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (rHandIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(8, bonesPtr[i] + (ulong)rHandIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (lKneeIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(9, bonesPtr[i] + (ulong)lKneeIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (rKneeIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(10, bonesPtr[i] + (ulong)rKneeIdx[i] * Off.MeshComponentBonesMatrixSize);
+                            if (lHandIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], lHandIdx[i]));
+                            if (rHandIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], rHandIdx[i]));
+                            if (lKneeIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], lKneeIdx[i]));
+                            if (rKneeIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], rKneeIdx[i]));
                         }
                         else if (SkeletonLevel == SkeletonDetail.Baller14)
                         {
-                            if (lShoulderIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(11, bonesPtr[i] + (ulong)lShoulderIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (rShoulderIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(12, bonesPtr[i] + (ulong)rShoulderIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (lElbowIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(13, bonesPtr[i] + (ulong)lElbowIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (rElbowIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(14, bonesPtr[i] + (ulong)rElbowIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (lHandIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(7, bonesPtr[i] + (ulong)lHandIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (rHandIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(8, bonesPtr[i] + (ulong)rHandIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (lKneeIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(9, bonesPtr[i] + (ulong)lKneeIdx[i] * Off.MeshComponentBonesMatrixSize);
-                            if (rKneeIdx[i] >= 0 && bonesPtr[i] != 0) r[i].AddValueEntry<Matrix3x4>(10, bonesPtr[i] + (ulong)rKneeIdx[i] * Off.MeshComponentBonesMatrixSize);
+                            if (lShoulderIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], lShoulderIdx[i]));
+                            if (rShoulderIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], rShoulderIdx[i]));
+                            if (lElbowIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], lElbowIdx[i]));
+                            if (rElbowIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], rElbowIdx[i]));
+                            if (lHandIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], lHandIdx[i]));
+                            if (rHandIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], rHandIdx[i]));
+                            if (lKneeIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], lKneeIdx[i]));
+                            if (rKneeIdx[i] >= 0 && bonesPtr[i] != 0) scatter.PrepareReadValue<Matrix3x4>(BoneAddress(bonesPtr[i], rKneeIdx[i]));
                         }
-                        if (animPtr[i] != 0) r[i].AddValueEntry<int>(1, animPtr[i] + Off.CharacterStanceType);
-                        int idx = i;
-                        r[idx].Completed += (_, cb) =>
-                        {
-                            cb.TryGetValue<Matrix3x4>(0, out headMat[idx]); cb.TryGetValue<Matrix3x4>(2, out hipMat[idx]);
-                            cb.TryGetValue<Matrix3x4>(3, out lFootMat[idx]); cb.TryGetValue<Matrix3x4>(4, out rFootMat[idx]);
-                            cb.TryGetValue<Matrix3x4>(5, out neckMat[idx]); cb.TryGetValue<Matrix3x4>(6, out spineMat[idx]);
-                            cb.TryGetValue<Matrix3x4>(7, out lHandMat[idx]); cb.TryGetValue<Matrix3x4>(8, out rHandMat[idx]);
-                            cb.TryGetValue<Matrix3x4>(9, out lKneeMat[idx]); cb.TryGetValue<Matrix3x4>(10, out rKneeMat[idx]);
-                            cb.TryGetValue<Matrix3x4>(11, out lShoulderMat[idx]); cb.TryGetValue<Matrix3x4>(12, out rShoulderMat[idx]);
-                            cb.TryGetValue<Matrix3x4>(13, out lElbowMat[idx]); cb.TryGetValue<Matrix3x4>(14, out rElbowMat[idx]);
-                            stanceA[idx] = EntityStance.UNKNOWN;
-                            if (animPtr[idx] != 0 && cb.TryGetValue<int>(1, out int raw))
-                                stanceA[idx] = raw switch { 0 => EntityStance.STAND, 1 => EntityStance.CROUCH, 2 => EntityStance.PRONE, _ => EntityStance.UNKNOWN };
-                        };
+                        if (animPtr[i] != 0) scatter.PrepareReadValue<int>(animPtr[i] + Off.CharacterStanceType);
                     }
-                    m2.Execute();
+                    scatter.Execute();
+
+                    for (int i = 0; i < cap; i++)
+                    {
+                        if (headIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], headIdx[i]), out headMat[i]);
+                        if (hipIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], hipIdx[i]), out hipMat[i]);
+                        if (lFootIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], lFootIdx[i]), out lFootMat[i]);
+                        if (rFootIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], rFootIdx[i]), out rFootMat[i]);
+                        if (neckIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], neckIdx[i]), out neckMat[i]);
+                        if (spineIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], spineIdx[i]), out spineMat[i]);
+                        if (lHandIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], lHandIdx[i]), out lHandMat[i]);
+                        if (rHandIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], rHandIdx[i]), out rHandMat[i]);
+                        if (lKneeIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], lKneeIdx[i]), out lKneeMat[i]);
+                        if (rKneeIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], rKneeIdx[i]), out rKneeMat[i]);
+                        if (lShoulderIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], lShoulderIdx[i]), out lShoulderMat[i]);
+                        if (rShoulderIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], rShoulderIdx[i]), out rShoulderMat[i]);
+                        if (lElbowIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], lElbowIdx[i]), out lElbowMat[i]);
+                        if (rElbowIdx[i] >= 0 && bonesPtr[i] != 0) scatter.ReadValue(BoneAddress(bonesPtr[i], rElbowIdx[i]), out rElbowMat[i]);
+
+                        stanceA[i] = EntityStance.UNKNOWN;
+                        if (animPtr[i] != 0 && scatter.ReadValue(animPtr[i] + Off.CharacterStanceType, out int raw))
+                        {
+                            stanceA[i] = raw switch
+                            {
+                                0 => EntityStance.STAND,
+                                1 => EntityStance.CROUCH,
+                                2 => EntityStance.PRONE,
+                                _ => EntityStance.UNKNOWN
+                            };
+                        }
+                    }
                 }
+
+                static ulong BoneAddress(ulong bones, int index)
+                    => bones + (ulong)index * Off.MeshComponentBonesMatrixSize;
 
                 var cam = Game.Camera.Position;
                 var bestByBody = new Dictionary<ulong, ActorDto>(capacity: cap);
@@ -1025,29 +1045,31 @@ namespace ArmaReforgerFeeder
             var players = DmaMemory.ReadArray<ulong>(arr, count) ?? Array.Empty<ulong>();
             if (players.Length == 0) return map;
             var names = new string[players.Length]; var pawns = new ulong[players.Length];
-            using (var s1 = DmaMemory.Scatter())
+            using (var scatter = DmaMemory.Scatter(useCache: true))
             {
-                var rd = s1.AddRound();
                 for (int i = 0; i < players.Length; i++)
                 {
-                    ulong p = players[i]; if (p == 0) continue; int idx = i;
-                    rd[idx].AddValueEntry<ulong>(0, p + Off.Player_Name);
-                    rd[idx].AddValueEntry<ulong>(1, p + Off.Player_FirstLevelPtr);
-                    rd[idx].Completed += (_, cb) =>
-                    {
-                        if (cb.TryGetValue<ulong>(0, out ulong namePtr) && namePtr != 0)
-                        {
-                            var s = DmaMemory.ReadString(namePtr, 64, Encoding.UTF8);
-                            if (IsLikelyName(s)) names[idx] = s;
-                        }
-                        if (cb.TryGetValue<ulong>(1, out ulong lvl1) && lvl1 != 0)
-                        {
-                            if (DmaMemory.Read(lvl1 + Off.FirstLevel_ControlledEntity, out ulong ctrlEnt) && ctrlEnt != 0)
-                                DmaMemory.Read(ctrlEnt + Off.ControlledEntity_Ptr2, out pawns[idx]);
-                        }
-                    };
+                    ulong p = players[i];
+                    if (p == 0) continue;
+                    scatter.PrepareReadValue<ulong>(p + Off.Player_Name);
+                    scatter.PrepareReadValue<ulong>(p + Off.Player_FirstLevelPtr);
                 }
-                s1.Execute();
+                scatter.Execute();
+                for (int i = 0; i < players.Length; i++)
+                {
+                    ulong p = players[i];
+                    if (p == 0) continue;
+                    if (scatter.ReadValue(p + Off.Player_Name, out ulong namePtr) && namePtr != 0)
+                    {
+                        var s = DmaMemory.ReadString(namePtr, 64, Encoding.UTF8);
+                        if (IsLikelyName(s)) names[i] = s;
+                    }
+                    if (scatter.ReadValue(p + Off.Player_FirstLevelPtr, out ulong lvl1) && lvl1 != 0)
+                    {
+                        if (DmaMemory.Read(lvl1 + Off.FirstLevel_ControlledEntity, out ulong ctrlEnt) && ctrlEnt != 0)
+                            DmaMemory.Read(ctrlEnt + Off.ControlledEntity_Ptr2, out pawns[i]);
+                    }
+                }
             }
             for (int i = 0; i < players.Length; i++) if (pawns[i] != 0 && !string.IsNullOrWhiteSpace(names[i])) map[pawns[i]] = names[i];
             return map;

@@ -14,7 +14,6 @@ using MamboDMA.Services;
 using VmmSharpEx;
 using VmmSharpEx.Extensions;
 using VmmSharpEx.Scatter;
-using VmmSharpEx.Scatter.V2;
 using VFlags = VmmSharpEx.Options.VmmFlags;
 
 namespace MamboDMA;
@@ -63,6 +62,7 @@ public static class DmaMemory
 
         Pid = WaitForPidByName(exeName);
         Base = WaitForModuleBase(Pid, moduleName ?? exeName);
+        LogScatterSmokeCheck();
     }
 
     /// <summary>Non-blocking probe: returns true if PID & Base resolved right now.</summary>
@@ -80,6 +80,7 @@ public static class DmaMemory
             if (baseAddr == 0) { error = "Module base not found."; return false; }
 
             Pid = pid; Base = baseAddr;
+            LogScatterSmokeCheck();
             return true;
         }
         catch (Exception ex) { error = ex.Message; return false; }
@@ -231,7 +232,7 @@ public static class DmaMemory
     public static ulong FindSignature(string signature, ulong AddrMin = 0, ulong AddrMax = ulong.MaxValue)
     {
         EnsureAttached();
-        return _vmm.FindSignature(Pid, signature, AddrMin, AddrMax);
+        return _vmm!.FindSignature(Pid, signature, AddrMin, AddrMax);
     }
 
     public static bool Read(ulong address, Span<byte> dst, VmmFlags flags = VmmFlags.NONE)
@@ -361,24 +362,134 @@ public static class DmaMemory
 
     #region Scatter Helpers
 
-    /// <summary>Create a new scatter map bound to the current game PID.</summary>
-    public static ScatterReadMap Scatter()
+    /// <summary>Create a guarded scatter handle bound to the current game PID.</summary>
+    public static DmaScatter Scatter(bool useCache = false)
     {
         EnsureAttached();
-        return new ScatterReadMap(_vmm!, Pid);
+        return new DmaScatter(
+            new VmmScatter(_vmm!, Pid, useCache ? VFlags.NONE : VFlags.NOCACHE));
+    }
+
+    /// <summary>
+    /// Create an ordered scatter map bound to the current game PID.
+    /// Reserved for the dependent DayZ read rounds planned in Issue #3.
+    /// </summary>
+    public static VmmScatterMap ScatterMap()
+    {
+        EnsureAttached();
+        return new VmmScatterMap(_vmm!, Pid);
     }
 
     /// <summary>
     /// Execute a single scatter round defined by <paramref name="define"/>.
     /// </summary>
-    public static void ScatterRound(Action<ScatterReadRound> define, bool useCache = false)
+    public static void ScatterRound(Action<DmaScatter> define, bool useCache = false)
     {
         EnsureAttached();
 
-        using var map = new ScatterReadMap(_vmm!, Pid);
-        var rd = map.AddRound(useCache);
-        define(rd);
-        map.Execute();
+        using var scatter = Scatter(useCache);
+        define(scatter);
+        scatter.Execute();
+    }
+
+    /// <summary>
+    /// Thin, single-use guard around the supported VmmScatter API.
+    /// Empty scatter execution is skipped because the native API requires at least one prepared operation.
+    /// </summary>
+    public sealed class DmaScatter : IDisposable
+    {
+        private readonly VmmScatter _scatter;
+        private bool _hasPreparedOperation;
+        private bool _executed;
+
+        internal DmaScatter(VmmScatter scatter) => _scatter = scatter;
+
+        public bool PrepareRead(ulong address, uint byteCount)
+        {
+            EnsureNotExecuted();
+            bool prepared = _scatter.PrepareRead(address, byteCount);
+            _hasPreparedOperation |= prepared;
+            return prepared;
+        }
+
+        public bool PrepareReadValue<T>(ulong address) where T : unmanaged
+        {
+            EnsureNotExecuted();
+            bool prepared = _scatter.PrepareReadValue<T>(address);
+            _hasPreparedOperation |= prepared;
+            return prepared;
+        }
+
+        public void Execute()
+        {
+            EnsureNotExecuted();
+            _executed = true;
+            if (_hasPreparedOperation)
+                _scatter.Execute();
+        }
+
+        public bool ReadValue<T>(ulong address, out T value) where T : unmanaged
+            => _scatter.ReadValue(address, out value);
+
+        public string ReadString(ulong address, int byteCount, Encoding encoding)
+            => _scatter.ReadString(address, byteCount, encoding) ?? string.Empty;
+
+        private void EnsureNotExecuted()
+        {
+            if (_executed)
+                throw new InvalidOperationException("DmaScatter is single-use. Create a new handle for another execution.");
+        }
+
+        public void Dispose() => _scatter.Dispose();
+    }
+
+    private static void LogScatterSmokeCheck()
+    {
+        try
+        {
+            bool directOk = Read(Base, out ushort directSignature);
+
+            bool uncachedPrepared;
+            bool uncachedOk;
+            ushort uncachedSignature;
+            using (var scatter = Scatter(useCache: false))
+            {
+                uncachedPrepared = scatter.PrepareReadValue<ushort>(Base);
+                scatter.Execute();
+                uncachedOk = scatter.ReadValue(Base, out uncachedSignature);
+            }
+
+            bool cachedPrepared;
+            bool cachedOk;
+            ushort cachedSignature;
+            using (var scatter = Scatter(useCache: true))
+            {
+                cachedPrepared = scatter.PrepareReadValue<ushort>(Base);
+                scatter.Execute();
+                cachedOk = scatter.ReadValue(Base, out cachedSignature);
+            }
+
+            bool passed =
+                directOk &&
+                uncachedPrepared &&
+                uncachedOk &&
+                cachedPrepared &&
+                cachedOk &&
+                directSignature == 0x5A4D &&
+                uncachedSignature == directSignature &&
+                cachedSignature == directSignature;
+
+            Logger.Info(
+                $"[DMA/Scatter] smoke={(passed ? "PASS" : "FAIL")} " +
+                $"pid={Pid} base=0x{Base:X} directOk={directOk} " +
+                $"uncachedPrepared={uncachedPrepared} uncachedOk={uncachedOk} " +
+                $"cachedPrepared={cachedPrepared} cachedOk={cachedOk} " +
+                $"direct=0x{directSignature:X4} uncached=0x{uncachedSignature:X4} cached=0x{cachedSignature:X4}");
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[DMA/Scatter] smoke=ERROR pid={Pid} base=0x{Base:X}: {ex.Message}");
+        }
     }
 
     /// <summary>

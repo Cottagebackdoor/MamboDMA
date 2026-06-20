@@ -75,31 +75,30 @@ namespace MamboDMA.Games.ABI
 
             try
             {
-                using var map = DmaMemory.Scatter();
-                var r = map.AddRound(false);
-
                 ulong arr = mesh + ABIOffsets.USkeletalMeshComponent_CachedComponentSpaceTransforms;
-                r[0].AddValueEntry<ulong>(2, arr + 0x0);
-                r[0].AddValueEntry<int>(3, arr + 0x8);
-                map.Execute();
+                ulong dataAddress = arr + 0x0;
+                ulong countAddress = arr + 0x8;
+                using var scatter = DmaMemory.Scatter();
+                scatter.PrepareReadValue<ulong>(dataAddress);
+                scatter.PrepareReadValue<int>(countAddress);
+                scatter.Execute();
 
                 var ctw = ctwOverride;
                 if (!IsSane(ctw)) { dbg.Note = "CTW override invalid"; return false; }
                 dbg.ComponentToWorld_Used = ctw;
 
-                if (!r[0].TryGetValue(2, out ulong data) || data == 0 ||
-                    !r[0].TryGetValue(3, out int count) || count <= 0)
+                if (!scatter.ReadValue(dataAddress, out ulong data) || data == 0 ||
+                    !scatter.ReadValue(countAddress, out int count) || count <= 0)
                 { dbg.Note = "Bones header invalid"; return false; }
 
                 // Guard: make sure the highest index we read exists
                 if (_fetch[^1] >= count) { dbg.Note = "Bones count shorter than fetch set"; return false; }
 
-                using var map2 = DmaMemory.Scatter();
-                var r2 = map2.AddRound(false);
+                using var boneScatter = DmaMemory.Scatter();
                 const int SZ = 0x30; // sizeof(FTransform)
                 for (int i = 0; i < _fetch.Length; i++)
-                    r2[i].AddValueEntry<FTransform>(0, data + (ulong)(_fetch[i] * SZ));
-                map2.Execute();
+                    boneScatter.PrepareReadValue<FTransform>(data + (ulong)(_fetch[i] * SZ));
+                boneScatter.Execute();
 
                 const int SAMPLE = 8;
                 dbg.SampleCount = Math.Min(SAMPLE, _fetch.Length);
@@ -110,7 +109,8 @@ namespace MamboDMA.Games.ABI
                 worldPoints = new Vector3[_fetch.Length];
                 for (int i = 0; i < _fetch.Length; i++)
                 {
-                    if (!r2[i].TryGetValue(0, out FTransform boneCS))
+                    ulong boneAddress = data + (ulong)(_fetch[i] * SZ);
+                    if (!boneScatter.ReadValue(boneAddress, out FTransform boneCS))
                     { dbg.Note = "Bone read failed"; return false; }
 
                     // Reject NaNs early

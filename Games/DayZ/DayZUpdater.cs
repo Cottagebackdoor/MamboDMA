@@ -20,6 +20,7 @@ namespace MamboDMA.Games.DayZ
         private const int SlowEntityLimit = 16_384;
         private const int ItemEntityLimit = 32_768;
         private const int EntityScatterChunkSize = 4_096;
+        private const int EntityUpdateIntervalMs = 50;
         private const int DiagnosticSampleCount = 3;
         private const int DiagnosticIntervalMs = 5_000;
         private const int LocalPlayerProbeIntervalMs = 10_000;
@@ -397,7 +398,7 @@ namespace MamboDMA.Games.DayZ
                     MaybeLogError("Entities", ex);
                 }
 
-                await Task.Delay(100, token).ConfigureAwait(false);
+                await Task.Delay(EntityUpdateIntervalMs, token).ConfigureAwait(false);
             }
         }
 

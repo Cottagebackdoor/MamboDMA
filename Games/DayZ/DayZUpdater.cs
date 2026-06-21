@@ -11,6 +11,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using MamboDMA.Diagnostics;
 using MamboDMA.Services;
 
 namespace MamboDMA.Games.DayZ
@@ -49,6 +50,40 @@ namespace MamboDMA.Games.DayZ
         private static ulong _localPlayerPathEntity;
         private static LocalPlayerPath? _localPlayerPath;
 
+        // _entityPass (declared above) is reused for entityHz — do not add a second entity counter.
+        private static long _worldPasses;
+        private static long _cameraPasses;
+        private static long _itemRefreshes;
+        // volatile-style access: producers Volatile.Write, readers Volatile.Read for stale-gap math.
+        private static long _lastWorldTicks;
+        private static long _lastCameraTicks;
+        private static long _lastEntityTicks;
+        private static long _lastItemRefreshTicks;
+
+        private static readonly RollingSampleWindow _entityPassMs   = new();
+        private static readonly RollingSampleWindow _prepareMs      = new();
+        private static readonly RollingSampleWindow _metadataExecMs = new();
+        private static readonly RollingSampleWindow _positionExecMs = new();
+        private static readonly RollingSampleWindow _parseMs        = new();
+        private static readonly RollingSampleWindow _worldPassMs    = new();
+        private static readonly RollingSampleWindow _cameraPassMs   = new();
+
+        // DayZ-side wrappers only — Memory.cs intentionally untouched so other games are unaffected.
+        private static long _directReadCount;
+        private static long _directReadTotalTicks;
+
+        // Cached/uncached counts make NOCACHE intent observable and surface accidental drift.
+        private static long _scatterCachedCount;
+        private static long _scatterUncachedCount;
+
+        // Only the producer thread that wins the throttle CAS reads/writes these — no Interlocked needed.
+        private static long _prevFramesPublished;
+        private static long _prevWorldPasses;
+        private static long _prevCameraPasses;
+        private static long _prevEntityPasses;
+        private static long _prevItemRefreshes;
+        private static long _prevFrameLogTicks;
+
         // Producer-private latest-value state. The three subsystem loops update
         // their slot under _frameLock and then publish a unified DayZFrameSnapshot
         // so consumers always see a consistent (world, camera, entities) triple.
@@ -85,8 +120,38 @@ namespace MamboDMA.Games.DayZ
             if (!ShouldLog(ref _nextFrameDiagnostic, 1_000))
                 return;
 
+            long nowTicks = Stopwatch.GetTimestamp();
+            long prevTicks = Volatile.Read(ref _prevFrameLogTicks);
+            double elapsedSec = prevTicks == 0
+                ? 0d
+                : (nowTicks - prevTicks) / (double)Stopwatch.Frequency;
+            Volatile.Write(ref _prevFrameLogTicks, nowTicks);
+
+            long worldPasses    = Interlocked.Read(ref _worldPasses);
+            long cameraPasses   = Interlocked.Read(ref _cameraPasses);
+            long entityPasses   = Interlocked.Read(ref _entityPass);
+            long itemRefreshes  = Interlocked.Read(ref _itemRefreshes);
+
+            double publishHz       = HzFromDelta(published,       ref _prevFramesPublished, elapsedSec);
+            double worldHz         = HzFromDelta(worldPasses,     ref _prevWorldPasses,     elapsedSec);
+            double cameraHz        = HzFromDelta(cameraPasses,    ref _prevCameraPasses,    elapsedSec);
+            double entityHz        = HzFromDelta(entityPasses,    ref _prevEntityPasses,    elapsedSec);
+            double itemRefreshHz   = HzFromDelta(itemRefreshes,   ref _prevItemRefreshes,   elapsedSec);
+
+            double worldStaleMs        = StaleMs(nowTicks, Volatile.Read(ref _lastWorldTicks));
+            double cameraStaleMs       = StaleMs(nowTicks, Volatile.Read(ref _lastCameraTicks));
+            double entityStaleMs       = StaleMs(nowTicks, Volatile.Read(ref _lastEntityTicks));
+            double itemRefreshStaleMs  = StaleMs(nowTicks, Volatile.Read(ref _lastItemRefreshTicks));
+
+            int overlayFps = DayZRenderMetrics.LastOverlayFps;
+            string overlayFpsField = overlayFps <= 0 ? "warming" : overlayFps.ToString();
+
             Logger.Info(
-                $"[DayZ/Frame] framesPublished={published} " +
+                $"[DayZ/Frame] framesPublished={published} publishHz={publishHz:F1} " +
+                $"worldHz={worldHz:F1} cameraHz={cameraHz:F1} entityHz={entityHz:F1} " +
+                $"itemRefreshHz={itemRefreshHz:F1} overlayFps={overlayFpsField} " +
+                $"worldStaleMs={worldStaleMs:F1} cameraStaleMs={cameraStaleMs:F1} " +
+                $"entityStaleMs={entityStaleMs:F1} itemRefreshStaleMs={itemRefreshStaleMs:F1} " +
                 $"world=0x{frame.World.WorldAddress:X16} " +
                 $"camera={(frame.Camera is { IsValid: true })} " +
                 $"entities={frame.Entities.Length} " +
@@ -94,6 +159,22 @@ namespace MamboDMA.Games.DayZ
                 $"zombies={frame.World.Zombies} " +
                 $"cars={frame.World.Cars} " +
                 $"items={frame.World.ItemCount}");
+        }
+
+        private static double HzFromDelta(long current, ref long previous, double elapsedSec)
+        {
+            long delta = current - Volatile.Read(ref previous);
+            Volatile.Write(ref previous, current);
+            if (elapsedSec <= 0d || delta <= 0)
+                return 0d;
+            return delta / elapsedSec;
+        }
+
+        private static double StaleMs(long nowTicks, long lastTicks)
+        {
+            if (lastTicks <= 0)
+                return 0d;
+            return (nowTicks - lastTicks) * 1000.0 / Stopwatch.Frequency;
         }
 
         public static void Start()
@@ -158,6 +239,23 @@ namespace MamboDMA.Games.DayZ
             Interlocked.Exchange(ref _framesPublished, 0);
             Interlocked.Exchange(ref _nextLocalPlayerProbe, 0);
             Interlocked.Exchange(ref _nextFrameDiagnostic, 0);
+            Interlocked.Exchange(ref _worldPasses, 0);
+            Interlocked.Exchange(ref _cameraPasses, 0);
+            Interlocked.Exchange(ref _itemRefreshes, 0);
+            Volatile.Write(ref _lastWorldTicks, 0);
+            Volatile.Write(ref _lastCameraTicks, 0);
+            Volatile.Write(ref _lastEntityTicks, 0);
+            Volatile.Write(ref _lastItemRefreshTicks, 0);
+            Interlocked.Exchange(ref _directReadCount, 0);
+            Interlocked.Exchange(ref _directReadTotalTicks, 0);
+            Interlocked.Exchange(ref _scatterCachedCount, 0);
+            Interlocked.Exchange(ref _scatterUncachedCount, 0);
+            _prevFramesPublished = 0;
+            _prevWorldPasses = 0;
+            _prevCameraPasses = 0;
+            _prevEntityPasses = 0;
+            _prevItemRefreshes = 0;
+            _prevFrameLogTicks = 0;
             _localPlayerPathWorld = 0;
             _localPlayerPathEntity = 0;
             _localPlayerPath = null;
@@ -187,12 +285,15 @@ namespace MamboDMA.Games.DayZ
         {
             while (!token.IsCancellationRequested)
             {
+                long worldStart = Stopwatch.GetTimestamp();
+                bool worldOk = false;
                 try
                 {
                     var snapshot = BuildWorldSnapshot();
                     lock (_frameLock) { _latestWorld = snapshot; }
                     RepublishFrame();
                     MaybeLogWorldSnapshot(snapshot);
+                    worldOk = true;
                 }
                 catch (Exception ex)
                 {
@@ -206,6 +307,13 @@ namespace MamboDMA.Games.DayZ
                     };
                     lock (_frameLock) { _latestWorld = fallback; }
                     RepublishFrame();
+                }
+
+                _worldPassMs.Add(Stopwatch.GetElapsedTime(worldStart).TotalMilliseconds);
+                if (worldOk)
+                {
+                    Interlocked.Increment(ref _worldPasses);
+                    Volatile.Write(ref _lastWorldTicks, Stopwatch.GetTimestamp());
                 }
 
                 await Task.Delay(50, token).ConfigureAwait(false);
@@ -344,6 +452,8 @@ namespace MamboDMA.Games.DayZ
         {
             while (!token.IsCancellationRequested)
             {
+                long cameraStart = Stopwatch.GetTimestamp();
+                bool cameraOk = false;
                 try
                 {
                     DayZSnapshot snapshot;
@@ -355,12 +465,20 @@ namespace MamboDMA.Games.DayZ
 
                     lock (_frameLock) { _latestCamera = camera; }
                     RepublishFrame();
+                    cameraOk = camera is { IsValid: true };
                 }
                 catch (Exception ex)
                 {
                     MaybeLogError("Camera", ex);
                     lock (_frameLock) { _latestCamera = null; }
                     RepublishFrame();
+                }
+
+                _cameraPassMs.Add(Stopwatch.GetElapsedTime(cameraStart).TotalMilliseconds);
+                if (cameraOk)
+                {
+                    Interlocked.Increment(ref _cameraPasses);
+                    Volatile.Write(ref _lastCameraTicks, Stopwatch.GetTimestamp());
                 }
 
                 await Task.Delay(16, token).ConfigureAwait(false);
@@ -472,6 +590,16 @@ namespace MamboDMA.Games.DayZ
 
                     scatterMetrics.TotalMs = Stopwatch.GetElapsedTime(passStart).TotalMilliseconds;
 
+                    _entityPassMs.Add(scatterMetrics.TotalMs);
+                    _prepareMs.Add(scatterMetrics.PrepareMs);
+                    _metadataExecMs.Add(scatterMetrics.MetadataExecuteMs);
+                    _positionExecMs.Add(scatterMetrics.PositionExecuteMs);
+                    _parseMs.Add(scatterMetrics.ParseMs);
+                    Volatile.Write(ref _lastEntityTicks, Stopwatch.GetTimestamp());
+                    // Item table is gathered every entity-loop pass; itemRefreshHz exposes that cadence as a real number.
+                    Interlocked.Increment(ref _itemRefreshes);
+                    Volatile.Write(ref _lastItemRefreshTicks, Stopwatch.GetTimestamp());
+
                     if (logSamples)
                     {
                         LogGatherDiagnostics(gatherResults, parsedByPointer);
@@ -499,6 +627,32 @@ namespace MamboDMA.Games.DayZ
                         Logger.Info(
                             $"[DayZ/Perf] entityPass={scatterMetrics.TotalMs:F2}ms " +
                             $"published={completeSnapshot.Length} itemEntities={itemEntities.Length}");
+
+                        var entityPassStats   = _entityPassMs.SnapshotAndReset();
+                        var worldPassStats    = _worldPassMs.SnapshotAndReset();
+                        var cameraPassStats   = _cameraPassMs.SnapshotAndReset();
+                        var prepareStats      = _prepareMs.SnapshotAndReset();
+                        var metadataExecStats = _metadataExecMs.SnapshotAndReset();
+                        var positionExecStats = _positionExecMs.SnapshotAndReset();
+                        var parseStats        = _parseMs.SnapshotAndReset();
+
+                        long directReads      = Interlocked.Read(ref _directReadCount);
+                        long directReadTicks  = Interlocked.Read(ref _directReadTotalTicks);
+                        double directReadMs   = directReadTicks * 1000.0 / Stopwatch.Frequency;
+                        long scatterCached    = Interlocked.Read(ref _scatterCachedCount);
+                        long scatterUncached  = Interlocked.Read(ref _scatterUncachedCount);
+
+                        Logger.Info(
+                            $"[DayZ/PerfSummary] " +
+                            $"entityPass={{{entityPassStats}}} " +
+                            $"worldPass={{{worldPassStats}}} " +
+                            $"cameraPass={{{cameraPassStats}}} " +
+                            $"prepare={{{prepareStats}}} " +
+                            $"metadataExec={{{metadataExecStats}}} " +
+                            $"positionExec={{{positionExecStats}}} " +
+                            $"parse={{{parseStats}}} " +
+                            $"directReads={directReads} totalDirectReadMs={directReadMs:F2} " +
+                            $"scatterCached={scatterCached} scatterUncached={scatterUncached}");
                     }
                 }
                 catch (Exception ex)
@@ -560,6 +714,7 @@ namespace MamboDMA.Games.DayZ
                 for (int index = 0; index < chunkCount; index++)
                     states[index] = new EntityReadState(candidates[chunkStart + index]);
 
+                Interlocked.Increment(ref _scatterUncachedCount);
                 using (DmaMemory.DmaScatter metadataScatter = DmaMemory.Scatter(useCache: false))
                 {
                     int preparedMetadataOperations = 0;
@@ -675,6 +830,7 @@ namespace MamboDMA.Games.DayZ
                     int preparedPositionOperations = 0;
                     if (states.Any(state => IsPlausiblePointer(state.VisualStatePointer)))
                     {
+                        Interlocked.Increment(ref _scatterUncachedCount);
                         positionScatter = DmaMemory.Scatter(useCache: false);
                         long prepareStart = Stopwatch.GetTimestamp();
                         foreach (EntityReadState state in states)
@@ -1960,6 +2116,8 @@ namespace MamboDMA.Games.DayZ
             if (!DmaMemory.IsAttached)
                 return false;
 
+            // Instrumented only here (not in TryReadPointer) since TryReadPointer delegates through this method.
+            long start = Stopwatch.GetTimestamp();
             try
             {
                 return DmaMemory.Read(address, out value);
@@ -1967,6 +2125,12 @@ namespace MamboDMA.Games.DayZ
             catch
             {
                 return false;
+            }
+            finally
+            {
+                long delta = Stopwatch.GetTimestamp() - start;
+                Interlocked.Add(ref _directReadTotalTicks, delta);
+                Interlocked.Increment(ref _directReadCount);
             }
         }
 

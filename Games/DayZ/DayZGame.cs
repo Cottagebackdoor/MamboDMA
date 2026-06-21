@@ -1,14 +1,47 @@
 #nullable enable
 
+using System.Diagnostics;
 using System.Numerics;
+using System.Threading;
 using ImGuiNET;
+using MamboDMA.Diagnostics;
 using MamboDMA.Services;
+using Raylib_cs;
 using static MamboDMA.Misc;
 using static MamboDMA.OverlayWindow;
 using static MamboDMA.Games.DayZ.DayZUpdater;
 
 namespace MamboDMA.Games.DayZ
 {
+    internal static class DayZRenderMetrics
+    {
+        public static readonly RollingSampleWindow DrawMs = new();
+        public static long DrawnBoxes;
+        public static long DrawnLabels;
+        public static long ProjectionAttempts;
+        public static long ProjectionFailures;
+        // Latest-value field, not a counter — never reset.
+        public static long SnapshotEntities;
+        public static long Candidates;
+        public static long Frames;
+        // volatile: written from render thread, read from producer thread when composing [DayZ/Frame].
+        public static volatile int LastOverlayFps;
+
+        private static long _nextRenderLogTicks;
+
+        public static bool ShouldLog(int intervalMs)
+        {
+            long now = System.Environment.TickCount64;
+            long next = Volatile.Read(ref _nextRenderLogTicks);
+            if (now < next)
+                return false;
+            return Interlocked.CompareExchange(
+                ref _nextRenderLogTicks,
+                now + intervalMs,
+                next) == next;
+        }
+    }
+
     public sealed class DayZGame : IGame
     {
         public string Name => "DayZ";
@@ -59,6 +92,11 @@ namespace MamboDMA.Games.DayZ
         public void Draw(ImGuiWindowFlags winFlags)
         {
             if (UiVisibility.MenusHidden) return;
+            long drawStart = Stopwatch.GetTimestamp();
+            DayZRenderMetrics.LastOverlayFps = Raylib.GetFPS();
+            Interlocked.Increment(ref DayZRenderMetrics.Frames);
+            try
+            {
             Config<DayZConfig>.DrawConfigPanel(Name, cfg =>
             {
                 bool vmmReady = MamboDMA.DmaMemory.IsVmmReady;
@@ -99,20 +137,30 @@ namespace MamboDMA.Games.DayZ
                 var snap = frame.World;
                 var cam  = frame.Camera;
                 var ents = frame.Entities;
+                Volatile.Write(ref DayZRenderMetrics.SnapshotEntities, ents.Length);
 
                 // ESP drawing
                 if (cfg.EnableESP && cfg.ShowPlayers)
                     foreach (var p in ents.Where(e => e.Category == EntityType.Player))
+                    {
+                        Interlocked.Increment(ref DayZRenderMetrics.Candidates);
                         DrawEntityEsp(p, cfg.PlayerColor, cam, snap, cfg);
+                    }
 
                 if (cfg.EnableESP && cfg.ShowZombies)
                     foreach (var z in ents.Where(e => e.Category == EntityType.Zombie))
+                    {
+                        Interlocked.Increment(ref DayZRenderMetrics.Candidates);
                         DrawEntityEsp(z, cfg.ZombieColor, cam, snap, cfg);
+                    }
 
                 if (cfg.EnableESP && cfg.ShowLoot)
                     foreach (var item in ents.Where(e =>
                         e.Category == EntityType.Weapon || e.Category == EntityType.Ammo || e.Category == EntityType.Food))
+                    {
+                        Interlocked.Increment(ref DayZRenderMetrics.Candidates);
                         DrawEntityEsp(item, cfg.ItemColor, cam, snap, cfg);
+                    }
 
                 // Options
                 ImGui.Separator();
@@ -230,6 +278,40 @@ namespace MamboDMA.Games.DayZ
 
                 ImGui.End();
             }
+            }
+            finally
+            {
+                DayZRenderMetrics.DrawMs.Add(
+                    Stopwatch.GetElapsedTime(drawStart).TotalMilliseconds);
+                MaybeLogRenderMetrics();
+            }
+        }
+
+        private static void MaybeLogRenderMetrics()
+        {
+            if (!DayZRenderMetrics.ShouldLog(5_000))
+                return;
+
+            long frames           = Interlocked.Exchange(ref DayZRenderMetrics.Frames, 0);
+            long candidates       = Interlocked.Exchange(ref DayZRenderMetrics.Candidates, 0);
+            long drawnBoxes       = Interlocked.Exchange(ref DayZRenderMetrics.DrawnBoxes, 0);
+            long drawnLabels      = Interlocked.Exchange(ref DayZRenderMetrics.DrawnLabels, 0);
+            long projAttempts     = Interlocked.Exchange(ref DayZRenderMetrics.ProjectionAttempts, 0);
+            long projFailures     = Interlocked.Exchange(ref DayZRenderMetrics.ProjectionFailures, 0);
+            long snapshotEntities = Volatile.Read(ref DayZRenderMetrics.SnapshotEntities);
+            var renderMs          = DayZRenderMetrics.DrawMs.SnapshotAndReset();
+            int overlayFps        = DayZRenderMetrics.LastOverlayFps;
+            double projSuccessRate = projAttempts > 0
+                ? (projAttempts - projFailures) * 100.0 / projAttempts
+                : 0d;
+
+            Logger.Info(
+                $"[DayZ/Render] frames={frames} overlayFps={overlayFps} " +
+                $"renderMs={{{renderMs}}} " +
+                $"snapshotEntities={snapshotEntities} candidates={candidates} " +
+                $"drawnBoxes={drawnBoxes} drawnLabels={drawnLabels} " +
+                $"projAttempts={projAttempts} projFailures={projFailures} " +
+                $"projSuccessRate={projSuccessRate:F1}%");
         }
 
         private static void DrawEntityCategoryTab(string label, IEnumerable<Entity> ents)
@@ -312,9 +394,13 @@ namespace MamboDMA.Games.DayZ
             if (hasDistance && distance > cfg.MaxDrawDistance)
                 return;
 
+            Interlocked.Increment(ref DayZRenderMetrics.ProjectionAttempts);
             if (!DayZUpdater.WorldToScreenDayZ(cam, entity.Position,
                     new Vector2(ScreenService.Current.W, ScreenService.Current.H), out var screenPos))
+            {
+                Interlocked.Increment(ref DayZRenderMetrics.ProjectionFailures);
                 return;
+            }
 
             var dl = ImGui.GetForegroundDrawList();
             uint col = ImGui.ColorConvertFloat4ToU32(color);
@@ -324,6 +410,7 @@ namespace MamboDMA.Games.DayZ
             var max = new Vector2(screenPos.X + half, screenPos.Y + half);
 
             dl.AddRect(min, max, col, 0f, ImDrawFlags.None, 2f);
+            Interlocked.Increment(ref DayZRenderMetrics.DrawnBoxes);
 
             string name = !string.IsNullOrWhiteSpace(entity.DisplayName)
                 ? entity.DisplayName
@@ -348,6 +435,7 @@ namespace MamboDMA.Games.DayZ
             uint shadow = ImGui.ColorConvertFloat4ToU32(new Vector4(0f, 0f, 0f, 0.9f));
             dl.AddText(textPosition + Vector2.One, shadow, label);
             dl.AddText(textPosition, col, label);
+            Interlocked.Increment(ref DayZRenderMetrics.DrawnLabels);
         }
 
         private static string FormatCandidateCount(int count)

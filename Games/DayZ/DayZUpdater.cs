@@ -3,9 +3,11 @@
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -37,14 +39,62 @@ namespace MamboDMA.Games.DayZ
         private static long _nextWorldDiagnostic;
         private static long _nextEntityDiagnostic;
         private static long _nextErrorDiagnostic;
+        private static long _nextFrameDiagnostic;
         private static long _nextLocalPlayerProbe;
         private static long _entityPass;
+        private static long _framesPublished;
+        // Written and read only on the WorldLoop thread (via BuildWorldSnapshot → ResolveLocalPlayer).
+        // Not guarded by _frameLock; do not access from CameraLoop, EntityLoop, or consumers.
         private static ulong _localPlayerPathWorld;
         private static ulong _localPlayerPathEntity;
         private static LocalPlayerPath? _localPlayerPath;
 
-        public static ulong WorldPtr => DayZSnapshots.Current.WorldAddress;
-        public static ulong NetMgrPtr => DayZSnapshots.Current.NetworkManagerAddress;
+        // Producer-private latest-value state. The three subsystem loops update
+        // their slot under _frameLock and then publish a unified DayZFrameSnapshot
+        // so consumers always see a consistent (world, camera, entities) triple.
+        private static readonly object _frameLock = new();
+        private static DayZSnapshot _latestWorld = DayZSnapshot.Empty;
+        private static DayZCamera? _latestCamera;
+        private static ImmutableArray<Entity> _latestEntities = ImmutableArray<Entity>.Empty;
+
+        public static ulong WorldPtr => DayZFrameSnapshots.Current.World.WorldAddress;
+        public static ulong NetMgrPtr => DayZFrameSnapshots.Current.World.NetworkManagerAddress;
+
+        // Publishes the current latest world+camera+entities triple as a single
+        // DayZFrameSnapshot. Lock is held only for the three reads + construction;
+        // the actual publication is lock-free Volatile.Write inside the holder.
+        private static void RepublishFrame()
+        {
+            DayZFrameSnapshot frame;
+            lock (_frameLock)
+            {
+                frame = new DayZFrameSnapshot
+                {
+                    World = _latestWorld,
+                    Camera = _latestCamera,
+                    Entities = _latestEntities,
+                };
+            }
+            DayZFrameSnapshots.Publish(frame);
+            long published = Interlocked.Increment(ref _framesPublished);
+            MaybeLogFrameDiagnostic(published, frame);
+        }
+
+        private static void MaybeLogFrameDiagnostic(long published, DayZFrameSnapshot frame)
+        {
+            if (!ShouldLog(ref _nextFrameDiagnostic, 1_000))
+                return;
+
+            Logger.Info(
+                $"[DayZ/Frame] framesPublished={published} " +
+                $"world=0x{frame.World.WorldAddress:X16} " +
+                $"camera={(frame.Camera is { IsValid: true })} " +
+                $"entities={frame.Entities.Length} " +
+                $"players={frame.World.Players} " +
+                $"zombies={frame.World.Zombies} " +
+                $"cars={frame.World.Cars} " +
+                $"items={frame.World.ItemCount}");
+        }
 
         public static void Start()
         {
@@ -52,6 +102,11 @@ namespace MamboDMA.Games.DayZ
             {
                 if (_cts is { IsCancellationRequested: false })
                     return;
+
+                Logger.Info($"[DayZ/Lifecycle] event=start pid={DmaMemory.Pid}");
+                Logger.Info(
+                    $"[DayZ/Lifecycle] event=attached " +
+                    $"pid={DmaMemory.Pid} base=0x{DmaMemory.Base:X16}");
 
                 _cts?.Dispose();
                 _cts = new CancellationTokenSource();
@@ -83,18 +138,31 @@ namespace MamboDMA.Games.DayZ
             if (cts is null)
                 return;
 
+            long finalFramesPublished = Interlocked.Read(ref _framesPublished);
+            Logger.Info(
+                $"[DayZ/Lifecycle] event=stop framesPublished={finalFramesPublished}");
+
             try { cts.Cancel(); } catch { }
             try { Task.WaitAll(workers, 750); } catch { }
             cts.Dispose();
 
-            DayZCameraSnapshots.Publish(null);
-            EntitySnapshots.Publish(Array.Empty<Entity>());
+            lock (_frameLock)
+            {
+                _latestWorld = DayZSnapshot.Empty;
+                _latestCamera = null;
+                _latestEntities = ImmutableArray<Entity>.Empty;
+            }
+            DayZFrameSnapshots.Publish(DayZFrameSnapshot.Empty);
             ItemTraces.Clear();
             Interlocked.Exchange(ref _entityPass, 0);
+            Interlocked.Exchange(ref _framesPublished, 0);
             Interlocked.Exchange(ref _nextLocalPlayerProbe, 0);
+            Interlocked.Exchange(ref _nextFrameDiagnostic, 0);
             _localPlayerPathWorld = 0;
             _localPlayerPathEntity = 0;
             _localPlayerPath = null;
+
+            Logger.Info($"[DayZ/Lifecycle] event=detached reason=stop");
         }
 
         private static async Task RunLoop(
@@ -122,19 +190,22 @@ namespace MamboDMA.Games.DayZ
                 try
                 {
                     var snapshot = BuildWorldSnapshot();
-                    DayZSnapshots.Publish(snapshot);
+                    lock (_frameLock) { _latestWorld = snapshot; }
+                    RepublishFrame();
                     MaybeLogWorldSnapshot(snapshot);
                 }
                 catch (Exception ex)
                 {
                     MaybeLogError("World", ex);
-                    DayZSnapshots.Publish(DayZSnapshot.Empty with
+                    var fallback = DayZSnapshot.Empty with
                     {
                         VmmReady = DmaMemory.IsVmmReady,
                         DmaAttached = DmaMemory.IsAttached,
                         ProcessId = DmaMemory.Pid,
                         ModuleBase = DmaMemory.Base
-                    });
+                    };
+                    lock (_frameLock) { _latestWorld = fallback; }
+                    RepublishFrame();
                 }
 
                 await Task.Delay(50, token).ConfigureAwait(false);
@@ -210,7 +281,8 @@ namespace MamboDMA.Games.DayZ
                     ItemEntityLimit);
             }
 
-            var entities = EntitySnapshots.Current;
+            ImmutableArray<Entity> entities;
+            lock (_frameLock) { entities = _latestEntities; }
             if (IsPlausiblePointer(world))
             {
                 LocalPlayerResult resolved = ResolveLocalPlayer(
@@ -222,37 +294,50 @@ namespace MamboDMA.Games.DayZ
                 localPlayerResolution = resolved.Resolution;
             }
 
-            return new DayZSnapshot(
-                VmmReady: vmmReady,
-                DmaAttached: dmaAttached,
-                Attached: dmaAttached && IsPlausiblePointer(world),
-                ProcessId: processId,
-                ModuleBase: moduleBase,
-                WorldAddress: worldAddress,
-                World: world,
-                NetworkAddress: networkAddress,
-                Network: network,
-                NetworkManagerAddress: networkManagerAddress,
-                NetworkManager: networkManager,
-                Camera: camera,
-                LocalPlayerReference: localPlayerReference,
-                LocalPlayer: localPlayer,
-                LocalPlayerResolution: localPlayerResolution,
-                PlayerOn: playerOn,
-                LocalPlayerPosition: localPlayerPosition,
-                NearTable: near.Pointer,
-                NearCount: near.AllocatedCount,
-                FarTable: far.Pointer,
-                FarCount: far.AllocatedCount,
-                SlowTable: slow.Pointer,
-                SlowAllocatedCount: slow.AllocatedCount,
-                SlowCount: slow.ValidCount,
-                ItemTable: items.Pointer,
-                ItemAllocatedCount: items.AllocatedCount,
-                ItemCount: items.ValidCount,
-                Players: entities.Count(e => e.Category == EntityType.Player),
-                Zombies: entities.Count(e => e.Category == EntityType.Zombie),
-                Cars: entities.Count(e => e.Category == EntityType.Car));
+            int playerCount = 0, zombieCount = 0, carCount = 0;
+            foreach (Entity entity in entities)
+            {
+                switch (entity.Category)
+                {
+                    case EntityType.Player: playerCount++; break;
+                    case EntityType.Zombie: zombieCount++; break;
+                    case EntityType.Car: carCount++; break;
+                }
+            }
+
+            return new DayZSnapshot
+            {
+                VmmReady = vmmReady,
+                DmaAttached = dmaAttached,
+                Attached = dmaAttached && IsPlausiblePointer(world),
+                ProcessId = processId,
+                ModuleBase = moduleBase,
+                WorldAddress = worldAddress,
+                World = world,
+                NetworkAddress = networkAddress,
+                Network = network,
+                NetworkManagerAddress = networkManagerAddress,
+                NetworkManager = networkManager,
+                Camera = camera,
+                LocalPlayerReference = localPlayerReference,
+                LocalPlayer = localPlayer,
+                LocalPlayerResolution = localPlayerResolution,
+                PlayerOn = playerOn,
+                LocalPlayerPosition = localPlayerPosition,
+                NearTable = near.Pointer,
+                NearCount = near.AllocatedCount,
+                FarTable = far.Pointer,
+                FarCount = far.AllocatedCount,
+                SlowTable = slow.Pointer,
+                SlowAllocatedCount = slow.AllocatedCount,
+                SlowCount = slow.ValidCount,
+                ItemTable = items.Pointer,
+                ItemAllocatedCount = items.AllocatedCount,
+                ItemCount = items.ValidCount,
+                Players = playerCount,
+                Zombies = zombieCount,
+                Cars = carCount,
+            };
         }
 
         private static async Task CameraLoop(CancellationToken token)
@@ -261,21 +346,21 @@ namespace MamboDMA.Games.DayZ
             {
                 try
                 {
-                    var snapshot = DayZSnapshots.Current;
+                    DayZSnapshot snapshot;
+                    lock (_frameLock) { snapshot = _latestWorld; }
+
+                    DayZCamera? camera = null;
                     if (snapshot.Attached && IsPlausiblePointer(snapshot.Camera))
-                    {
-                        var camera = ReadCamera(snapshot.Camera);
-                        DayZCameraSnapshots.Publish(camera);
-                    }
-                    else
-                    {
-                        DayZCameraSnapshots.Publish(null);
-                    }
+                        camera = ReadCamera(snapshot.Camera);
+
+                    lock (_frameLock) { _latestCamera = camera; }
+                    RepublishFrame();
                 }
                 catch (Exception ex)
                 {
                     MaybeLogError("Camera", ex);
-                    DayZCameraSnapshots.Publish(null);
+                    lock (_frameLock) { _latestCamera = null; }
+                    RepublishFrame();
                 }
 
                 await Task.Delay(16, token).ConfigureAwait(false);
@@ -288,10 +373,12 @@ namespace MamboDMA.Games.DayZ
             {
                 try
                 {
-                    var snapshot = DayZSnapshots.Current;
+                    DayZSnapshot snapshot;
+                    lock (_frameLock) { snapshot = _latestWorld; }
                     if (!snapshot.Attached || !IsPlausiblePointer(snapshot.World))
                     {
-                        EntitySnapshots.Publish(Array.Empty<Entity>());
+                        lock (_frameLock) { _latestEntities = ImmutableArray<Entity>.Empty; }
+                        RepublishFrame();
                         await Task.Delay(100, token).ConfigureAwait(false);
                         continue;
                     }
@@ -352,15 +439,36 @@ namespace MamboDMA.Games.DayZ
                         .Where(entity => itemPointers.Contains(entity.Ptr))
                         .ToArray();
 
-                    EntitySnapshots.Publish(completeSnapshot);
-                    TrackItems(itemEntities, logSamples, pass);
+                    // Wrap the producer's Entity[] zero-copy as ImmutableArray<Entity>.
+                    // Safe because completeSnapshot is local to this iteration and is
+                    // not mutated after this point.
+                    ImmutableArray<Entity> publishedEntities =
+                        ImmutableCollectionsMarshal.AsImmutableArray(completeSnapshot);
 
-                    DayZSnapshots.Mutate(current => current with
+                    int playerCount = 0, zombieCount = 0, carCount = 0;
+                    foreach (Entity entity in completeSnapshot)
                     {
-                        Players = completeSnapshot.Count(e => e.Category == EntityType.Player),
-                        Zombies = completeSnapshot.Count(e => e.Category == EntityType.Zombie),
-                        Cars = completeSnapshot.Count(e => e.Category == EntityType.Car)
-                    });
+                        switch (entity.Category)
+                        {
+                            case EntityType.Player: playerCount++; break;
+                            case EntityType.Zombie: zombieCount++; break;
+                            case EntityType.Car: carCount++; break;
+                        }
+                    }
+
+                    lock (_frameLock)
+                    {
+                        _latestEntities = publishedEntities;
+                        _latestWorld = _latestWorld with
+                        {
+                            Players = playerCount,
+                            Zombies = zombieCount,
+                            Cars = carCount,
+                        };
+                    }
+                    RepublishFrame();
+
+                    TrackItems(itemEntities, logSamples, pass);
 
                     scatterMetrics.TotalMs = Stopwatch.GetElapsedTime(passStart).TotalMilliseconds;
 
@@ -1189,7 +1297,8 @@ namespace MamboDMA.Games.DayZ
         private static LocalPlayerResult SelectParsedPlayerFallback(
             IReadOnlyList<Entity> players)
         {
-            DayZCamera? camera = DayZCameraSnapshots.Current;
+            DayZCamera? camera;
+            lock (_frameLock) { camera = _latestCamera; }
             if (camera is { IsValid: true })
             {
                 Entity? nearest = null;
@@ -1409,21 +1518,6 @@ namespace MamboDMA.Games.DayZ
 
             screenPosition = new Vector2(projectedX, projectedY);
             return true;
-        }
-
-        public static class DayZCameraSnapshots
-        {
-            private static DayZCamera? _current;
-            public static DayZCamera? Current => Volatile.Read(ref _current);
-            public static void Publish(DayZCamera? camera) => Volatile.Write(ref _current, camera);
-        }
-
-        public static class EntitySnapshots
-        {
-            private static Entity[] _current = Array.Empty<Entity>();
-            public static IReadOnlyList<Entity> Current => Volatile.Read(ref _current);
-            public static void Publish(IEnumerable<Entity> entities)
-                => Volatile.Write(ref _current, entities as Entity[] ?? entities.ToArray());
         }
 
         public sealed class Entity

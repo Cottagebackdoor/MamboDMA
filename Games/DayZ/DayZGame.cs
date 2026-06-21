@@ -95,9 +95,10 @@ namespace MamboDMA.Games.DayZ
                 // If not attached yet, stop here to prevent any crashes
                 if (!attached) return;
 
-                var snap = DayZSnapshots.Current;
-                var cam  = DayZUpdater.DayZCameraSnapshots.Current;
-                var ents = DayZUpdater.EntitySnapshots.Current;
+                var frame = DayZFrameSnapshots.Current;
+                var snap = frame.World;
+                var cam  = frame.Camera;
+                var ents = frame.Entities;
 
                 // ESP drawing
                 if (cfg.EnableESP && cfg.ShowPlayers)
@@ -156,9 +157,10 @@ namespace MamboDMA.Games.DayZ
             {
                 ImGui.Begin("DayZ Debug", ImGuiWindowFlags.AlwaysAutoResize);
 
-                var snap = DayZSnapshots.Current;
-                var cam  = DayZUpdater.DayZCameraSnapshots.Current;
-                var ents = DayZUpdater.EntitySnapshots.Current;
+                var frame = DayZFrameSnapshots.Current;
+                var snap = frame.World;
+                var cam  = frame.Camera;
+                var ents = frame.Entities;
 
                 if (ImGui.CollapsingHeader("World / Manager", ImGuiTreeNodeFlags.DefaultOpen))
                 {

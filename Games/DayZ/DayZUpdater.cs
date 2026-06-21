@@ -185,6 +185,8 @@ namespace MamboDMA.Games.DayZ
                     return;
 
                 Logger.Info($"[DayZ/Lifecycle] event=start pid={DmaMemory.Pid}");
+                // Clear on attach AND detach: detach guards a live session; attach guards against stale entries from a prior process.
+                DayZTypeCache.Clear();
                 Logger.Info(
                     $"[DayZ/Lifecycle] event=attached " +
                     $"pid={DmaMemory.Pid} base=0x{DmaMemory.Base:X16}");
@@ -259,6 +261,7 @@ namespace MamboDMA.Games.DayZ
             _localPlayerPathWorld = 0;
             _localPlayerPathEntity = 0;
             _localPlayerPath = null;
+            DayZTypeCache.Clear();
 
             Logger.Info($"[DayZ/Lifecycle] event=detached reason=stop");
         }
@@ -653,6 +656,16 @@ namespace MamboDMA.Games.DayZ
                             $"parse={{{parseStats}}} " +
                             $"directReads={directReads} totalDirectReadMs={directReadMs:F2} " +
                             $"scatterCached={scatterCached} scatterUncached={scatterUncached}");
+
+                        int cacheSize = DayZTypeCache.CurrentSize;
+                        var (cacheHits, cacheMisses, cacheInserts) = DayZTypeCache.SnapshotAndReset();
+                        long cacheTotal = cacheHits + cacheMisses;
+                        string cacheHitRate = cacheTotal > 0
+                            ? $"{(cacheHits * 100.0 / cacheTotal):F1}%"
+                            : "n/a";
+                        Logger.Info(
+                            $"[DayZ/TypeCache] size={cacheSize} hits={cacheHits} " +
+                            $"misses={cacheMisses} inserts={cacheInserts} hitRate={cacheHitRate}");
                     }
                 }
                 catch (Exception ex)
@@ -921,6 +934,17 @@ namespace MamboDMA.Games.DayZ
             {
                 problems.Add("invalid type pointer");
             }
+            else if (DayZTypeCache.TryGet(entity.TypePtr, out var cached))
+            {
+                entity.TypeName        = cached.TypeName;
+                entity.ModelName       = cached.ModelName;
+                entity.ConfigName      = cached.ConfigName;
+                entity.CleanName       = cached.CleanName;
+                entity.ObjectNamePtr   = cached.ObjectNamePtr;
+                entity.CategoryNamePtr = cached.CategoryNamePtr;
+                entity.CleanNamePtr    = cached.CleanNamePtr;
+                entity.Category        = cached.Category;
+            }
             else
             {
                 TryReadArmaStringField(
@@ -959,6 +983,19 @@ namespace MamboDMA.Games.DayZ
                 {
                     problems.Add("no valid type names");
                 }
+                else
+                {
+                    entity.Categorize();
+                    DayZTypeCache.Insert(entity.TypePtr, new DayZTypeCache.TypeMetadata(
+                        entity.TypeName,
+                        entity.ModelName,
+                        entity.ConfigName,
+                        entity.CleanName,
+                        entity.ObjectNamePtr,
+                        entity.CategoryNamePtr,
+                        entity.CleanNamePtr,
+                        entity.Category));
+                }
             }
 
             bool primaryPositionOk =
@@ -988,7 +1025,6 @@ namespace MamboDMA.Games.DayZ
                 problems.Add("invalid visual state/position");
             }
 
-            entity.Categorize();
             entity.IsValid = problems.Count == 0;
             entity.Validation = entity.IsValid ? "valid" : string.Join("; ", problems);
             return entity;

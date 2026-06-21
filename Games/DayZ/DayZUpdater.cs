@@ -19,6 +19,7 @@ namespace MamboDMA.Games.DayZ
         private const int FarEntityLimit = 8_192;
         private const int SlowEntityLimit = 16_384;
         private const int ItemEntityLimit = 32_768;
+        private const int EntityScatterChunkSize = 4_096;
         private const int DiagnosticSampleCount = 3;
         private const int DiagnosticIntervalMs = 5_000;
         private const int LocalPlayerProbeIntervalMs = 10_000;
@@ -295,35 +296,63 @@ namespace MamboDMA.Games.DayZ
                     }
 
                     bool logSamples = ShouldLog(ref _nextEntityDiagnostic, DiagnosticIntervalMs);
-                    long passStart = logSamples ? Stopwatch.GetTimestamp() : 0;
-                    var byPointer = new Dictionary<ulong, Entity>();
-
-                    AddTableEntities(
-                        byPointer,
-                        Entity.EnumerateEntities("Near", snapshot.NearTable, snapshot.NearCount, logSamples));
-                    AddTableEntities(
-                        byPointer,
-                        Entity.EnumerateEntities("Far", snapshot.FarTable, snapshot.FarCount, logSamples));
-                    AddTableEntities(
-                        byPointer,
-                        Entity.EnumerateStructuredEntities(
+                    long pass = Interlocked.Increment(ref _entityPass);
+                    long passStart = Stopwatch.GetTimestamp();
+                    var gatherResults = new List<EntityGatherResult>(4)
+                    {
+                        Entity.GatherEntities(
+                            "Near",
+                            EntityTableMembership.Near,
+                            snapshot.NearTable,
+                            snapshot.NearCount,
+                            logSamples),
+                        Entity.GatherEntities(
+                            "Far",
+                            EntityTableMembership.Far,
+                            snapshot.FarTable,
+                            snapshot.FarCount,
+                            logSamples),
+                        Entity.GatherStructuredEntities(
                             "Slow",
+                            EntityTableMembership.Slow,
                             snapshot.SlowTable,
                             snapshot.SlowAllocatedCount,
                             snapshot.SlowCount,
-                            logSamples));
+                            logSamples),
+                        Entity.GatherStructuredEntities(
+                            "Item",
+                            EntityTableMembership.Item,
+                            snapshot.ItemTable,
+                            snapshot.ItemAllocatedCount,
+                            snapshot.ItemCount,
+                            logSamples)
+                    };
 
-                    var itemEntities = Entity.EnumerateStructuredEntities(
-                        "Item",
-                        snapshot.ItemTable,
-                        snapshot.ItemAllocatedCount,
-                        snapshot.ItemCount,
-                        logSamples);
-                    AddTableEntities(byPointer, itemEntities);
+                    int candidateCount = gatherResults.Sum(result => result.Candidates.Count);
+                    int rejected = gatherResults.Sum(result => result.RejectedPointers);
+                    List<EntityCandidate> candidates = DeduplicateCandidates(gatherResults);
+                    var scatterMetrics = new EntityScatterMetrics
+                    {
+                        Pass = pass,
+                        Candidates = candidateCount,
+                        Deduplicated = candidates.Count,
+                        Rejected = rejected
+                    };
 
-                    var completeSnapshot = byPointer.Values.ToArray();
+                    Entity[] completeSnapshot = ParseCandidatesBatched(
+                        candidates,
+                        scatterMetrics);
+                    var parsedByPointer = completeSnapshot.ToDictionary(entity => entity.Ptr);
+                    var itemPointers = candidates
+                        .Where(candidate => candidate.IsItemMember)
+                        .Select(candidate => candidate.Pointer)
+                        .ToHashSet();
+                    var itemEntities = completeSnapshot
+                        .Where(entity => itemPointers.Contains(entity.Ptr))
+                        .ToArray();
+
                     EntitySnapshots.Publish(completeSnapshot);
-                    TrackItems(itemEntities, logSamples);
+                    TrackItems(itemEntities, logSamples, pass);
 
                     DayZSnapshots.Mutate(current => current with
                     {
@@ -332,11 +361,35 @@ namespace MamboDMA.Games.DayZ
                         Cars = completeSnapshot.Count(e => e.Category == EntityType.Car)
                     });
 
+                    scatterMetrics.TotalMs = Stopwatch.GetElapsedTime(passStart).TotalMilliseconds;
+
                     if (logSamples)
                     {
+                        LogGatherDiagnostics(gatherResults, parsedByPointer);
+                        LogRepresentativeEntities(
+                            gatherResults,
+                            scatterMetrics.ParsedByPointer);
                         Logger.Info(
-                            $"[DayZ/Perf] entityPass={Stopwatch.GetElapsedTime(passStart).TotalMilliseconds:F2}ms " +
-                            $"published={completeSnapshot.Length} itemEntities={itemEntities.Count}");
+                            $"[DayZ/Scatter] pass={scatterMetrics.Pass} " +
+                            $"candidates={scatterMetrics.Candidates} " +
+                            $"deduplicated={scatterMetrics.Deduplicated} " +
+                            $"chunks={scatterMetrics.Chunks} " +
+                            $"metadataPrepared={scatterMetrics.MetadataPrepared} " +
+                            $"metadataOk={scatterMetrics.MetadataOk} " +
+                            $"visualStateOk={scatterMetrics.VisualStateOk} " +
+                            $"futureVisualFallbacks={scatterMetrics.FutureVisualFallbacks} " +
+                            $"positionsPrepared={scatterMetrics.PositionsPrepared} " +
+                            $"positionsOk={scatterMetrics.PositionsOk} " +
+                            $"positionFallbacks={scatterMetrics.PositionFallbacks} " +
+                            $"rejected={scatterMetrics.Rejected} " +
+                            $"prepareMs={scatterMetrics.PrepareMs:F2} " +
+                            $"metadataExecuteMs={scatterMetrics.MetadataExecuteMs:F2} " +
+                            $"positionExecuteMs={scatterMetrics.PositionExecuteMs:F2} " +
+                            $"parseMs={scatterMetrics.ParseMs:F2} " +
+                            $"totalMs={scatterMetrics.TotalMs:F2}");
+                        Logger.Info(
+                            $"[DayZ/Perf] entityPass={scatterMetrics.TotalMs:F2}ms " +
+                            $"published={completeSnapshot.Length} itemEntities={itemEntities.Length}");
                     }
                 }
                 catch (Exception ex)
@@ -348,17 +401,332 @@ namespace MamboDMA.Games.DayZ
             }
         }
 
-        private static void AddTableEntities(
-            Dictionary<ulong, Entity> byPointer,
-            IReadOnlyList<Entity> entities)
+        private static List<EntityCandidate> DeduplicateCandidates(
+            IReadOnlyList<EntityGatherResult> gatherResults)
         {
-            foreach (var entity in entities)
-            {
-                if (!entity.IsValid || byPointer.ContainsKey(entity.Ptr))
-                    continue;
+            var byPointer = new Dictionary<ulong, EntityCandidate>();
+            var ordered = new List<EntityCandidate>();
 
-                byPointer.Add(entity.Ptr, entity);
+            foreach (EntityGatherResult result in gatherResults)
+            {
+                foreach (EntityCandidateOccurrence occurrence in result.Candidates)
+                {
+                    if (byPointer.TryGetValue(occurrence.Pointer, out EntityCandidate? existing))
+                    {
+                        existing.Memberships |= occurrence.Membership;
+                        continue;
+                    }
+
+                    var candidate = new EntityCandidate(
+                        occurrence.Pointer,
+                        occurrence.SourceTable,
+                        occurrence.SourceIndex,
+                        occurrence.Membership);
+                    byPointer.Add(candidate.Pointer, candidate);
+                    ordered.Add(candidate);
+                }
             }
+
+            return ordered;
+        }
+
+        private static Entity[] ParseCandidatesBatched(
+            IReadOnlyList<EntityCandidate> candidates,
+            EntityScatterMetrics metrics)
+        {
+            if (candidates.Count == 0)
+                return Array.Empty<Entity>();
+
+            var parsed = new List<Entity>(candidates.Count);
+            for (int chunkStart = 0;
+                 chunkStart < candidates.Count;
+                 chunkStart += EntityScatterChunkSize)
+            {
+                int chunkCount = Math.Min(
+                    EntityScatterChunkSize,
+                    candidates.Count - chunkStart);
+                metrics.Chunks++;
+
+                var states = new EntityReadState[chunkCount];
+                for (int index = 0; index < chunkCount; index++)
+                    states[index] = new EntityReadState(candidates[chunkStart + index]);
+
+                using (DmaMemory.DmaScatter metadataScatter = DmaMemory.Scatter(useCache: false))
+                {
+                    int preparedMetadataOperations = 0;
+                    long prepareStart = Stopwatch.GetTimestamp();
+                    foreach (EntityReadState state in states)
+                    {
+                        ulong pointer = state.Candidate.Pointer;
+                        state.TypePrepared = metadataScatter.PrepareReadValue<ulong>(
+                            pointer + DayZOffsets.Entity.Type);
+                        state.VisualStatePrepared = metadataScatter.PrepareReadValue<ulong>(
+                            pointer + DayZOffsets.Entity.VisualState);
+                        state.FutureVisualStatePrepared = metadataScatter.PrepareReadValue<ulong>(
+                            pointer + DayZOffsets.Entity.FutureVisualState);
+                        state.NetworkIdPrepared = metadataScatter.PrepareReadValue<uint>(
+                            pointer + DayZOffsets.Entity.NetworkId);
+                        state.IsDeadPrepared = metadataScatter.PrepareReadValue<byte>(
+                            pointer + DayZOffsets.Entity.IsDead);
+                        state.EntityDeadPrepared = metadataScatter.PrepareReadValue<byte>(
+                            pointer + DayZOffsets.Entity.EntityDead);
+
+                        preparedMetadataOperations +=
+                            CountPreparedMetadataOperations(state);
+                    }
+                    metrics.MetadataPrepared += preparedMetadataOperations;
+                    metrics.PrepareMs += Stopwatch.GetElapsedTime(
+                        prepareStart).TotalMilliseconds;
+
+                    if (preparedMetadataOperations > 0)
+                    {
+                        long executeStart = Stopwatch.GetTimestamp();
+                        metadataScatter.Execute();
+                        metrics.MetadataExecuteMs += Stopwatch.GetElapsedTime(
+                            executeStart).TotalMilliseconds;
+                    }
+
+                    foreach (EntityReadState state in states)
+                    {
+                        ulong pointer = state.Candidate.Pointer;
+                        ulong typePointer = 0;
+                        ulong visualStatePointer = 0;
+                        ulong futureVisualStatePointer = 0;
+                        uint networkId = 0;
+                        byte isDead = 0;
+                        byte entityDead = 0;
+                        bool typeOk =
+                            state.TypePrepared &&
+                            metadataScatter.ReadValue(
+                                pointer + DayZOffsets.Entity.Type,
+                                out typePointer);
+                        bool visualOk =
+                            state.VisualStatePrepared &&
+                            metadataScatter.ReadValue(
+                                pointer + DayZOffsets.Entity.VisualState,
+                                out visualStatePointer);
+                        bool futureVisualOk =
+                            state.FutureVisualStatePrepared &&
+                            metadataScatter.ReadValue(
+                                pointer + DayZOffsets.Entity.FutureVisualState,
+                                out futureVisualStatePointer);
+                        bool networkOk =
+                            state.NetworkIdPrepared &&
+                            metadataScatter.ReadValue(
+                                pointer + DayZOffsets.Entity.NetworkId,
+                                out networkId);
+                        bool isDeadOk =
+                            state.IsDeadPrepared &&
+                            metadataScatter.ReadValue(
+                                pointer + DayZOffsets.Entity.IsDead,
+                                out isDead);
+                        bool entityDeadOk =
+                            state.EntityDeadPrepared &&
+                            metadataScatter.ReadValue(
+                                pointer + DayZOffsets.Entity.EntityDead,
+                                out entityDead);
+
+                        metrics.MetadataOk +=
+                            (typeOk ? 1 : 0) +
+                            (visualOk ? 1 : 0) +
+                            (futureVisualOk ? 1 : 0) +
+                            (networkOk ? 1 : 0) +
+                            (isDeadOk ? 1 : 0) +
+                            (entityDeadOk ? 1 : 0);
+
+                        state.TypePointer =
+                            typeOk && IsPlausiblePointer(typePointer)
+                                ? typePointer
+                                : 0;
+                        state.NetworkId = networkOk ? networkId : 0;
+                        state.IsDead =
+                            (isDeadOk && isDead != 0) ||
+                            (entityDeadOk && entityDead != 0);
+
+                        if (visualOk && IsPlausiblePointer(visualStatePointer))
+                        {
+                            state.VisualStatePointer = visualStatePointer;
+                        }
+                        else if (futureVisualOk &&
+                                 IsPlausiblePointer(futureVisualStatePointer))
+                        {
+                            state.VisualStatePointer = futureVisualStatePointer;
+                            state.UsedFutureVisualState = true;
+                            metrics.FutureVisualFallbacks++;
+                        }
+
+                        if (IsPlausiblePointer(state.VisualStatePointer))
+                            metrics.VisualStateOk++;
+                    }
+                }
+
+                DmaMemory.DmaScatter? positionScatter = null;
+                try
+                {
+                    int preparedPositionOperations = 0;
+                    if (states.Any(state => IsPlausiblePointer(state.VisualStatePointer)))
+                    {
+                        positionScatter = DmaMemory.Scatter(useCache: false);
+                        long prepareStart = Stopwatch.GetTimestamp();
+                        foreach (EntityReadState state in states)
+                        {
+                            if (!IsPlausiblePointer(state.VisualStatePointer))
+                                continue;
+
+                            state.PositionPrepared = positionScatter.PrepareReadValue<Vector3>(
+                                state.VisualStatePointer + DayZOffsets.VisualState.Position);
+                            if (state.PositionPrepared)
+                                preparedPositionOperations++;
+                        }
+                        metrics.PositionsPrepared += preparedPositionOperations;
+                        metrics.PrepareMs += Stopwatch.GetElapsedTime(
+                            prepareStart).TotalMilliseconds;
+
+                        if (preparedPositionOperations > 0)
+                        {
+                            long executeStart = Stopwatch.GetTimestamp();
+                            positionScatter.Execute();
+                            metrics.PositionExecuteMs += Stopwatch.GetElapsedTime(
+                                executeStart).TotalMilliseconds;
+                        }
+                    }
+
+                    long parseStart = Stopwatch.GetTimestamp();
+                    foreach (EntityReadState state in states)
+                    {
+                        Entity entity;
+                        try
+                        {
+                            entity = ParseScatteredEntity(state, positionScatter, metrics);
+                        }
+                        catch (Exception ex)
+                        {
+                            entity = new Entity
+                            {
+                                Ptr = state.Candidate.Pointer,
+                                SourceTable = state.Candidate.SourceTable,
+                                SourceIndex = state.Candidate.SourceIndex,
+                                Validation = $"parse exception: {ex.GetType().Name}"
+                            };
+                        }
+
+                        metrics.ParsedByPointer[state.Candidate.Pointer] = entity;
+                        if (entity.IsValid)
+                            parsed.Add(entity);
+                        else
+                            metrics.Rejected++;
+                    }
+                    metrics.ParseMs += Stopwatch.GetElapsedTime(parseStart).TotalMilliseconds;
+                }
+                finally
+                {
+                    positionScatter?.Dispose();
+                }
+            }
+
+            return parsed.ToArray();
+        }
+
+        private static int CountPreparedMetadataOperations(EntityReadState state)
+            => (state.TypePrepared ? 1 : 0) +
+               (state.VisualStatePrepared ? 1 : 0) +
+               (state.FutureVisualStatePrepared ? 1 : 0) +
+               (state.NetworkIdPrepared ? 1 : 0) +
+               (state.IsDeadPrepared ? 1 : 0) +
+               (state.EntityDeadPrepared ? 1 : 0);
+
+        private static Entity ParseScatteredEntity(
+            EntityReadState state,
+            DmaMemory.DmaScatter? positionScatter,
+            EntityScatterMetrics metrics)
+        {
+            var entity = new Entity
+            {
+                Ptr = state.Candidate.Pointer,
+                SourceTable = state.Candidate.SourceTable,
+                SourceIndex = state.Candidate.SourceIndex,
+                TypePtr = state.TypePointer,
+                VisualStatePtr = state.VisualStatePointer,
+                NetworkId = state.NetworkId,
+                IsDead = state.IsDead
+            };
+            var problems = new List<string>(4);
+
+            if (!IsPlausiblePointer(entity.TypePtr))
+            {
+                problems.Add("invalid type pointer");
+            }
+            else
+            {
+                TryReadArmaStringField(
+                    entity.TypePtr,
+                    DayZOffsets.HumanType.ObjectName,
+                    out entity.ObjectNamePtr,
+                    out entity.TypeName);
+                TryReadArmaStringField(
+                    entity.TypePtr,
+                    DayZOffsets.HumanType.ModelNameUnverified,
+                    out _,
+                    out entity.ModelName);
+                TryReadArmaStringField(
+                    entity.TypePtr,
+                    DayZOffsets.HumanType.CategoryName,
+                    out entity.CategoryNamePtr,
+                    out entity.ConfigName);
+                TryReadArmaStringField(
+                    entity.TypePtr,
+                    DayZOffsets.HumanType.CleanName,
+                    out entity.CleanNamePtr,
+                    out entity.CleanName);
+
+                if (string.IsNullOrWhiteSpace(entity.CleanName))
+                {
+                    TryReadArmaStringField(
+                        entity.TypePtr,
+                        DayZOffsets.HumanType.CleanNameInternal,
+                        out entity.CleanNamePtr,
+                        out entity.CleanName);
+                }
+
+                if (string.IsNullOrWhiteSpace(entity.TypeName) &&
+                    string.IsNullOrWhiteSpace(entity.ConfigName) &&
+                    string.IsNullOrWhiteSpace(entity.CleanName))
+                {
+                    problems.Add("no valid type names");
+                }
+            }
+
+            bool primaryPositionOk =
+                state.PositionPrepared &&
+                positionScatter is not null &&
+                positionScatter.ReadValue(
+                    state.VisualStatePointer + DayZOffsets.VisualState.Position,
+                    out entity.Position) &&
+                IsPlausiblePosition(entity.Position);
+            if (primaryPositionOk)
+            {
+                entity.PositionReadMode = state.UsedFutureVisualState
+                    ? "future-visual-state+0x2C"
+                    : "visual-state+0x2C";
+                metrics.PositionsOk++;
+            }
+            else if (IsPlausiblePointer(state.VisualStatePointer) &&
+                     TryReadEntityPositionFallback(
+                         state.VisualStatePointer,
+                         out entity.Position,
+                         out entity.PositionReadMode))
+            {
+                metrics.PositionFallbacks++;
+            }
+            else
+            {
+                problems.Add("invalid visual state/position");
+            }
+
+            entity.Categorize();
+            entity.IsValid = problems.Count == 0;
+            entity.Validation = entity.IsValid ? "valid" : string.Join("; ", problems);
+            return entity;
         }
 
         private static LocalPlayerResult ResolveLocalPlayer(
@@ -1123,15 +1491,16 @@ namespace MamboDMA.Games.DayZ
                 Category = EntityType.GroundItem;
             }
 
-            public static List<Entity> EnumerateEntities(
+            internal static EntityGatherResult GatherEntities(
                 string tableName,
+                EntityTableMembership membership,
                 ulong tablePointer,
                 int count,
                 bool logSamples)
             {
-                var entities = new List<Entity>(Math.Min(Math.Max(count, 0), 1_024));
+                var result = new EntityGatherResult(tableName);
                 if (!IsPlausiblePointer(tablePointer) || count <= 0)
-                    return entities;
+                    return result;
 
                 ulong[]? pointers;
                 try
@@ -1141,29 +1510,40 @@ namespace MamboDMA.Games.DayZ
                 catch (Exception ex)
                 {
                     MaybeLogError($"{tableName} table", ex);
-                    return entities;
+                    return result;
                 }
 
                 if (pointers is null || pointers.Length == 0)
-                    return entities;
+                    return result;
 
                 int sampleLimit = logSamples ? Math.Min(DiagnosticSampleCount, pointers.Length) : 0;
                 for (int index = 0; index < pointers.Length; index++)
                 {
-                    Entity entity = Parse(tableName, index, pointers[index]);
+                    ulong pointer = pointers[index];
+                    bool isSample = index < sampleLimit;
+                    if (!IsPlausiblePointer(pointer))
+                    {
+                        result.RejectedPointers++;
+                        if (isSample)
+                            result.Samples.Add(new EntityCandidateSample(tableName, index, pointer));
+                        continue;
+                    }
 
-                    if (index < sampleLimit)
-                        LogEntityDiagnostic(entity);
-
-                    if (entity.IsValid)
-                        entities.Add(entity);
+                    result.Candidates.Add(new EntityCandidateOccurrence(
+                        pointer,
+                        tableName,
+                        index,
+                        membership));
+                    if (isSample)
+                        result.Samples.Add(new EntityCandidateSample(tableName, index, pointer));
                 }
 
-                return entities;
+                return result;
             }
 
-            public static List<Entity> EnumerateStructuredEntities(
+            internal static EntityGatherResult GatherStructuredEntities(
                 string tableName,
+                EntityTableMembership membership,
                 ulong tablePointer,
                 int allocatedCount,
                 int candidateValidCount,
@@ -1172,11 +1552,17 @@ namespace MamboDMA.Games.DayZ
                 int expectedCount = candidateValidCount >= 0
                     ? candidateValidCount
                     : allocatedCount;
-                var entities = new List<Entity>(
-                    Math.Min(Math.Max(expectedCount, 0), 1_024));
+                var result = new EntityGatherResult(tableName)
+                {
+                    IsStructured = true,
+                    TablePointer = tablePointer,
+                    AllocatedCount = allocatedCount,
+                    CandidateValidCount = candidateValidCount
+                };
+                result.Candidates.Capacity = Math.Min(Math.Max(expectedCount, 0), 1_024);
 
                 if (!IsPlausiblePointer(tablePointer) || allocatedCount <= 0)
-                    return entities;
+                    return result;
 
                 int requestedBytes;
                 try
@@ -1188,7 +1574,7 @@ namespace MamboDMA.Games.DayZ
                 {
                     MaybeLogError($"{tableName} structured table size", new InvalidOperationException(
                         $"Allocated count {allocatedCount} overflows the table byte size."));
-                    return entities;
+                    return result;
                 }
 
                 long readStart = logSamples ? Stopwatch.GetTimestamp() : 0;
@@ -1200,13 +1586,13 @@ namespace MamboDMA.Games.DayZ
                 catch (Exception ex)
                 {
                     MaybeLogError($"{tableName} structured table", ex);
-                    return entities;
+                    return result;
                 }
 
                 if (tableBytes is null ||
                     tableBytes.Length < DayZOffsets.StructuredEntityTable.EntryStride)
                 {
-                    return entities;
+                    return result;
                 }
 
                 int availableEntries = Math.Min(
@@ -1215,7 +1601,6 @@ namespace MamboDMA.Games.DayZ
                 int activeEntries = 0;
                 int invalidPointers = 0;
                 int duplicatePointers = 0;
-                int invalidEntities = 0;
                 int loggedEntities = 0;
                 var seenPointers = new HashSet<ulong>();
 
@@ -1254,6 +1639,7 @@ namespace MamboDMA.Games.DayZ
                     if (!IsPlausiblePointer(entityPointer))
                     {
                         invalidPointers++;
+                        result.RejectedPointers++;
                         continue;
                     }
 
@@ -1263,121 +1649,30 @@ namespace MamboDMA.Games.DayZ
                         continue;
                     }
 
-                    Entity entity = Parse(tableName, index, entityPointer);
                     if (logSamples && loggedEntities++ < DiagnosticSampleCount)
-                        LogEntityDiagnostic(entity);
-
-                    if (entity.IsValid)
-                        entities.Add(entity);
-                    else
-                        invalidEntities++;
-                }
-
-                if (logSamples)
-                {
-                    string candidateCount = candidateValidCount >= 0
-                        ? candidateValidCount.ToString()
-                        : "unknown";
-                    string countValidation = candidateValidCount < 0
-                        ? "unverified"
-                        : candidateValidCount == activeEntries
-                            ? "match"
-                            : "mismatch";
-
-                    Logger.Info(
-                        $"[DayZ/Table] table={tableName} pointer=0x{tablePointer:X} " +
-                        $"allocated={allocatedCount} candidateValid={candidateCount} " +
-                        $"scanned={availableEntries} activeFlags={activeEntries} " +
-                        $"parsed={entities.Count} invalidPointers={invalidPointers} " +
-                        $"duplicates={duplicatePointers} invalidEntities={invalidEntities} " +
-                        $"countValidation={countValidation} bytes={tableBytes.Length} " +
-                        $"bulkRead={Stopwatch.GetElapsedTime(readStart).TotalMilliseconds:F2}ms");
-                }
-
-                return entities;
-            }
-
-            private static Entity Parse(string tableName, int index, ulong entityPointer)
-            {
-                var entity = new Entity
-                {
-                    Ptr = entityPointer,
-                    SourceTable = tableName,
-                    SourceIndex = index
-                };
-
-                var problems = new List<string>(4);
-                if (!IsPlausiblePointer(entityPointer))
-                {
-                    entity.Validation = "invalid entity pointer";
-                    return entity;
-                }
-
-                if (!TryReadPointer(entityPointer + DayZOffsets.Entity.Type, out entity.TypePtr))
-                {
-                    problems.Add("invalid type pointer");
-                }
-                else
-                {
-                    TryReadArmaStringField(
-                        entity.TypePtr,
-                        DayZOffsets.HumanType.ObjectName,
-                        out entity.ObjectNamePtr,
-                        out entity.TypeName);
-                    TryReadArmaStringField(
-                        entity.TypePtr,
-                        DayZOffsets.HumanType.ModelNameUnverified,
-                        out _,
-                        out entity.ModelName);
-                    TryReadArmaStringField(
-                        entity.TypePtr,
-                        DayZOffsets.HumanType.CategoryName,
-                        out entity.CategoryNamePtr,
-                        out entity.ConfigName);
-                    TryReadArmaStringField(
-                        entity.TypePtr,
-                        DayZOffsets.HumanType.CleanName,
-                        out entity.CleanNamePtr,
-                        out entity.CleanName);
-
-                    if (string.IsNullOrWhiteSpace(entity.CleanName))
                     {
-                        TryReadArmaStringField(
-                            entity.TypePtr,
-                            DayZOffsets.HumanType.CleanNameInternal,
-                            out entity.CleanNamePtr,
-                            out entity.CleanName);
+                        result.Samples.Add(new EntityCandidateSample(
+                            tableName,
+                            index,
+                            entityPointer));
                     }
 
-                    if (string.IsNullOrWhiteSpace(entity.TypeName) &&
-                        string.IsNullOrWhiteSpace(entity.ConfigName) &&
-                        string.IsNullOrWhiteSpace(entity.CleanName))
-                    {
-                        problems.Add("no valid type names");
-                    }
-                }
-
-                if (!TryReadEntityPosition(
+                    result.Candidates.Add(new EntityCandidateOccurrence(
                         entityPointer,
-                        out entity.Position,
-                        out entity.VisualStatePtr,
-                        out entity.PositionReadMode))
-                {
-                    problems.Add("invalid visual state/position");
+                        tableName,
+                        index,
+                        membership));
                 }
 
-                TryReadValue(entityPointer + DayZOffsets.Entity.NetworkId, out entity.NetworkId);
-
-                byte isDead = 0;
-                byte entityDead = 0;
-                TryReadValue(entityPointer + DayZOffsets.Entity.IsDead, out isDead);
-                TryReadValue(entityPointer + DayZOffsets.Entity.EntityDead, out entityDead);
-                entity.IsDead = isDead != 0 || entityDead != 0;
-
-                entity.Categorize();
-                entity.IsValid = problems.Count == 0;
-                entity.Validation = entity.IsValid ? "valid" : string.Join("; ", problems);
-                return entity;
+                result.ScannedEntries = availableEntries;
+                result.ActiveEntries = activeEntries;
+                result.InvalidPointers = invalidPointers;
+                result.DuplicatePointers = duplicatePointers;
+                result.TableBytes = tableBytes.Length;
+                result.BulkReadMs = logSamples
+                    ? Stopwatch.GetElapsedTime(readStart).TotalMilliseconds
+                    : 0;
+                return result;
             }
         }
 
@@ -1450,6 +1745,43 @@ namespace MamboDMA.Games.DayZ
 
             // Diagnostic fallback for the previous interpretation. This should
             // normally be rejected once the correct +0x2C read succeeds.
+            if (TryReadValue(
+                    visualStatePointer +
+                    DayZOffsets.VisualState.Transform +
+                    DayZOffsets.VisualState.Position,
+                    out position) &&
+                IsPlausiblePosition(position))
+            {
+                readMode = "legacy+0x34";
+                return true;
+            }
+
+            position = default;
+            return false;
+        }
+
+        private static bool TryReadEntityPositionFallback(
+            ulong visualStatePointer,
+            out Vector3 position,
+            out string readMode)
+        {
+            position = default;
+            readMode = "";
+
+            // Compatibility fallback if +0x8 is a Transform pointer on another build.
+            if (TryReadPointer(
+                    visualStatePointer + DayZOffsets.VisualState.Transform,
+                    out ulong transformPointer) &&
+                TryReadValue(
+                    transformPointer + DayZOffsets.VisualState.PositionWithinTransform,
+                    out position) &&
+                IsPlausiblePosition(position))
+            {
+                readMode = "transform-pointer";
+                return true;
+            }
+
+            // Retain the previous +0x34 interpretation as the final compatibility path.
             if (TryReadValue(
                     visualStatePointer +
                     DayZOffsets.VisualState.Transform +
@@ -1630,9 +1962,68 @@ namespace MamboDMA.Games.DayZ
                 $"flag=0x{flag:X} entity=0x{entityPointer:X} metadata=0x{metadata:X}");
         }
 
-        private static void TrackItems(IReadOnlyList<Entity> items, bool logSamples)
+        private static void LogGatherDiagnostics(
+            IReadOnlyList<EntityGatherResult> gatherResults,
+            IReadOnlyDictionary<ulong, Entity> parsedByPointer)
         {
-            long pass = Interlocked.Increment(ref _entityPass);
+            foreach (EntityGatherResult result in gatherResults)
+            {
+                if (!result.IsStructured || result.TableBytes == 0)
+                    continue;
+
+                int parsed = result.Candidates.Count(candidate =>
+                    parsedByPointer.ContainsKey(candidate.Pointer));
+                int invalidEntities = result.Candidates.Count - parsed;
+                string candidateCount = result.CandidateValidCount >= 0
+                    ? result.CandidateValidCount.ToString()
+                    : "unknown";
+                string countValidation = result.CandidateValidCount < 0
+                    ? "unverified"
+                    : result.CandidateValidCount == result.ActiveEntries
+                        ? "match"
+                        : "mismatch";
+
+                Logger.Info(
+                    $"[DayZ/Table] table={result.TableName} pointer=0x{result.TablePointer:X} " +
+                    $"allocated={result.AllocatedCount} candidateValid={candidateCount} " +
+                    $"scanned={result.ScannedEntries} activeFlags={result.ActiveEntries} " +
+                    $"parsed={parsed} invalidPointers={result.InvalidPointers} " +
+                    $"duplicates={result.DuplicatePointers} invalidEntities={invalidEntities} " +
+                    $"countValidation={countValidation} bytes={result.TableBytes} " +
+                    $"bulkRead={result.BulkReadMs:F2}ms");
+            }
+        }
+
+        private static void LogRepresentativeEntities(
+            IReadOnlyList<EntityGatherResult> gatherResults,
+            IReadOnlyDictionary<ulong, Entity> parsedByPointer)
+        {
+            foreach (EntityCandidateSample sample in gatherResults.SelectMany(
+                         result => result.Samples))
+            {
+                if (parsedByPointer.TryGetValue(sample.Pointer, out Entity? entity))
+                {
+                    LogEntityDiagnostic(entity);
+                    continue;
+                }
+
+                LogEntityDiagnostic(new Entity
+                {
+                    Ptr = sample.Pointer,
+                    SourceTable = sample.SourceTable,
+                    SourceIndex = sample.SourceIndex,
+                    Validation = IsPlausiblePointer(sample.Pointer)
+                        ? "rejected during batched parse"
+                        : "invalid entity pointer"
+                });
+            }
+        }
+
+        private static void TrackItems(
+            IReadOnlyList<Entity> items,
+            bool logSamples,
+            long pass)
+        {
             int logged = 0;
 
             foreach (var item in items)
@@ -1765,6 +2156,116 @@ namespace MamboDMA.Games.DayZ
             ulong Pointer,
             int AllocatedCount,
             int ValidCount);
+
+        [Flags]
+        internal enum EntityTableMembership
+        {
+            None = 0,
+            Near = 1 << 0,
+            Far = 1 << 1,
+            Slow = 1 << 2,
+            Item = 1 << 3
+        }
+
+        internal readonly record struct EntityCandidateOccurrence(
+            ulong Pointer,
+            string SourceTable,
+            int SourceIndex,
+            EntityTableMembership Membership);
+
+        internal readonly record struct EntityCandidateSample(
+            string SourceTable,
+            int SourceIndex,
+            ulong Pointer);
+
+        internal sealed class EntityGatherResult
+        {
+            public EntityGatherResult(string tableName)
+            {
+                TableName = tableName;
+            }
+
+            public string TableName { get; }
+            public List<EntityCandidateOccurrence> Candidates { get; } = new();
+            public List<EntityCandidateSample> Samples { get; } = new();
+            public bool IsStructured { get; init; }
+            public ulong TablePointer { get; init; }
+            public int AllocatedCount { get; init; }
+            public int CandidateValidCount { get; init; } = -1;
+            public int RejectedPointers { get; set; }
+            public int ScannedEntries { get; set; }
+            public int ActiveEntries { get; set; }
+            public int InvalidPointers { get; set; }
+            public int DuplicatePointers { get; set; }
+            public int TableBytes { get; set; }
+            public double BulkReadMs { get; set; }
+        }
+
+        private sealed class EntityCandidate
+        {
+            public EntityCandidate(
+                ulong pointer,
+                string sourceTable,
+                int sourceIndex,
+                EntityTableMembership memberships)
+            {
+                Pointer = pointer;
+                SourceTable = sourceTable;
+                SourceIndex = sourceIndex;
+                Memberships = memberships;
+            }
+
+            public ulong Pointer { get; }
+            public string SourceTable { get; }
+            public int SourceIndex { get; }
+            public EntityTableMembership Memberships { get; set; }
+            public bool IsItemMember =>
+                (Memberships & EntityTableMembership.Item) != 0;
+        }
+
+        private sealed class EntityReadState
+        {
+            public EntityReadState(EntityCandidate candidate)
+            {
+                Candidate = candidate;
+            }
+
+            public EntityCandidate Candidate { get; }
+            public bool TypePrepared { get; set; }
+            public bool VisualStatePrepared { get; set; }
+            public bool FutureVisualStatePrepared { get; set; }
+            public bool NetworkIdPrepared { get; set; }
+            public bool IsDeadPrepared { get; set; }
+            public bool EntityDeadPrepared { get; set; }
+            public ulong TypePointer { get; set; }
+            public ulong VisualStatePointer { get; set; }
+            public uint NetworkId { get; set; }
+            public bool IsDead { get; set; }
+            public bool UsedFutureVisualState { get; set; }
+            public bool PositionPrepared { get; set; }
+        }
+
+        private sealed class EntityScatterMetrics
+        {
+            public long Pass { get; init; }
+            public int Candidates { get; init; }
+            public int Deduplicated { get; init; }
+            public int Chunks { get; set; }
+            public int MetadataPrepared { get; set; }
+            public int MetadataOk { get; set; }
+            public int VisualStateOk { get; set; }
+            public int FutureVisualFallbacks { get; set; }
+            public int PositionsPrepared { get; set; }
+            public int PositionsOk { get; set; }
+            public int PositionFallbacks { get; set; }
+            public int Rejected { get; set; }
+            public double PrepareMs { get; set; }
+            public double MetadataExecuteMs { get; set; }
+            public double PositionExecuteMs { get; set; }
+            public double ParseMs { get; set; }
+            public double TotalMs { get; set; }
+            public Dictionary<ulong, Entity> ParsedByPointer { get; } = new();
+        }
 
         private sealed record ItemTrace(
             uint NetworkId,

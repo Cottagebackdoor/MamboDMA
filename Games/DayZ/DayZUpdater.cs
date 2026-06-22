@@ -23,7 +23,7 @@ namespace MamboDMA.Games.DayZ
         private const int SlowEntityLimit = 16_384;
         private const int ItemEntityLimit = 32_768;
         private const int EntityScatterChunkSize = 4_096;
-        private const int EntityUpdateIntervalMs = 50;
+        private const int EntityUpdateIntervalMs = 16;
         private const int DiagnosticSampleCount = 3;
         private const int DiagnosticIntervalMs = 5_000;
         private const int LocalPlayerProbeIntervalMs = 10_000;
@@ -195,6 +195,9 @@ namespace MamboDMA.Games.DayZ
                 _cts = new CancellationTokenSource();
                 var token = _cts.Token;
 
+                // 1ms system timer so Task.Delay honors small intervals; otherwise Windows snaps to ~15.6ms.
+                TimerResolution.Enable1ms();
+
                 // Long-running update loops must not occupy the shared JobSystem workers.
                 _workers =
                 [
@@ -225,9 +228,17 @@ namespace MamboDMA.Games.DayZ
             Logger.Info(
                 $"[DayZ/Lifecycle] event=stop framesPublished={finalFramesPublished}");
 
-            try { cts.Cancel(); } catch { }
-            try { Task.WaitAll(workers, 750); } catch { }
-            cts.Dispose();
+            try
+            {
+                try { cts.Cancel(); } catch { }
+                try { Task.WaitAll(workers, 750); } catch { }
+                cts.Dispose();
+            }
+            finally
+            {
+                // Pair Enable1ms in Start so the refcount always releases even if shutdown throws.
+                TimerResolution.Disable1ms();
+            }
 
             lock (_frameLock)
             {
@@ -484,7 +495,7 @@ namespace MamboDMA.Games.DayZ
                     Volatile.Write(ref _lastCameraTicks, Stopwatch.GetTimestamp());
                 }
 
-                await Task.Delay(16, token).ConfigureAwait(false);
+                await Task.Delay(4, token).ConfigureAwait(false);
             }
         }
 
@@ -1657,14 +1668,23 @@ namespace MamboDMA.Games.DayZ
         {
             var camera = new DayZCamera { Pointer = cameraPointer };
 
-            TryReadValue(cameraPointer + DayZOffsets.Camera.ViewMatrix, out camera.ViewMatrixSelector);
-            TryReadValue(cameraPointer + DayZOffsets.Camera.ViewportSize, out camera.ViewportSize);
-            TryReadValue(cameraPointer + DayZOffsets.Camera.ProjectionD1Unverified, out camera.ProjectionD1);
-            TryReadValue(cameraPointer + DayZOffsets.Camera.ProjectionD2, out camera.ProjectionD2);
-            TryReadValue(cameraPointer + DayZOffsets.Camera.InvertedViewRight, out camera.InvertedViewRight);
-            TryReadValue(cameraPointer + DayZOffsets.Camera.InvertedViewUp, out camera.InvertedViewUp);
-            TryReadValue(cameraPointer + DayZOffsets.Camera.InvertedViewForward, out camera.InvertedViewForward);
-            TryReadValue(cameraPointer + DayZOffsets.Camera.InvertedViewTranslation, out camera.InvertedViewTranslation);
+            // Single buffer read so the game cannot rewrite matrix fields mid-read (torn-read fix).
+            Span<byte> buffer = stackalloc byte[DayZOffsets.Camera.StructSize];
+            // NOCACHE: matrix mutates every camera frame; cached reads were mixing pre/post-pan field values.
+            if (!DmaMemory.Read(cameraPointer, buffer, MamboDMA.Input.VmmFlags.NOCACHE))
+            {
+                camera.IsValid = false;
+                return camera;
+            }
+
+            camera.ViewMatrixSelector      = MemoryMarshal.Read<uint>   (buffer.Slice((int)DayZOffsets.Camera.ViewMatrix, 4));
+            camera.InvertedViewRight       = MemoryMarshal.Read<Vector3>(buffer.Slice((int)DayZOffsets.Camera.InvertedViewRight, 12));
+            camera.InvertedViewUp          = MemoryMarshal.Read<Vector3>(buffer.Slice((int)DayZOffsets.Camera.InvertedViewUp, 12));
+            camera.InvertedViewForward     = MemoryMarshal.Read<Vector3>(buffer.Slice((int)DayZOffsets.Camera.InvertedViewForward, 12));
+            camera.InvertedViewTranslation = MemoryMarshal.Read<Vector3>(buffer.Slice((int)DayZOffsets.Camera.InvertedViewTranslation, 12));
+            camera.ViewportSize            = MemoryMarshal.Read<Vector3>(buffer.Slice((int)DayZOffsets.Camera.ViewportSize, 12));
+            camera.ProjectionD1            = MemoryMarshal.Read<Vector3>(buffer.Slice((int)DayZOffsets.Camera.ProjectionD1Unverified, 12));
+            camera.ProjectionD2            = MemoryMarshal.Read<Vector3>(buffer.Slice((int)DayZOffsets.Camera.ProjectionD2, 12));
 
             camera.IsValid =
                 IsFinite(camera.ViewportSize) &&

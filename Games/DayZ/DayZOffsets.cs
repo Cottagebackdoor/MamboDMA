@@ -117,6 +117,9 @@ namespace MamboDMA.Games.DayZ
             // first projection vector. ProjectionD2 is confirmed by dump.log.
             public const ulong ProjectionD1Unverified = 0xD0;
             public const ulong ProjectionD2 = 0xDC;
+
+            // Length of ReadCamera's atomic struct read; bump if a new field extends past ProjectionD2.
+            public const int StructSize = 0xE8;
         }
 
         public static class Player

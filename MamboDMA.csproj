@@ -40,6 +40,10 @@
 	  <None Include="Assets\WebRadar\**\*.json" CopyToOutputDirectory="PreserveNewest" />
 	  <None Include="Assets\Img\**\*.svg" CopyToOutputDirectory="PreserveNewest" />
 	  <None Include="Assets\Img\**\*.ico" CopyToOutputDirectory="PreserveNewest" />
+	  <None Include="Assets\Maps\DayZ\**\*.png" CopyToOutputDirectory="PreserveNewest" />
+	  <None Include="Assets\Maps\DayZ\**\*.json" CopyToOutputDirectory="PreserveNewest" />
+	  <None Include="Assets\Maps\ABI\**\*.png" CopyToOutputDirectory="PreserveNewest" />
+	  <None Include="Assets\Maps\ABI\**\*.json" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 	<ItemGroup>
 	  <Content Include="Assets\Img\Logo.ico" />

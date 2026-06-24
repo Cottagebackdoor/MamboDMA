@@ -5,6 +5,8 @@ using System.Numerics;
 using System.Threading;
 using ImGuiNET;
 using MamboDMA.Diagnostics;
+using MamboDMA.Games.DayZ.Radar;
+using MamboDMA.WebRadar;
 using MamboDMA.Services;
 using Raylib_cs;
 using static MamboDMA.Misc;
@@ -54,6 +56,8 @@ namespace MamboDMA.Games.DayZ
         private bool _initialized;
         private bool _running;
 
+        private static readonly DayZWebRadarFrameSource _webRadarSource = new();
+
         // Change this if your process name differs.
         private const string _dayzExe = "DayZ_x64.exe";
 
@@ -66,6 +70,9 @@ namespace MamboDMA.Games.DayZ
             // initialize screen service from current monitor if needed
             if (ScreenService.Current.W <= 0 || ScreenService.Current.H <= 0)
                 ScreenService.UpdateFromMonitor(GameSelector.SelectedMonitor);
+
+            DayZMapRegistry.Log = Logger.Info;
+            DayZMapTextures.Log = Logger.Info;
 
             _initialized = true;
         }
@@ -89,6 +96,9 @@ namespace MamboDMA.Games.DayZ
         {
             if (!_running) return;
             DayZUpdater.Stop();
+            DayZRadarWindow.Reset();
+            DayZMapTextures.UnloadAll();
+            WebRadarUI.StopIfRunning();
             _running = false;
         }
 
@@ -102,6 +112,14 @@ namespace MamboDMA.Games.DayZ
             try
             {
             DrawEspPass();
+            DayZRadarWindow.Draw();
+
+            // Auto-detect must run regardless of menu visibility; otherwise hidden-menus play sessions never update the selected map.
+            if (Cfg.RadarAutoSelectMap)
+            {
+                var detected = DayZMapRegistry.ResolveByWorldName(DayZFrameSnapshots.Current.World.WorldName);
+                if (detected != null) Cfg.RadarSelectedMap = detected.Key;
+            }
 
             // Menu-only surface; ESP above already ran unconditionally.
             if (UiVisibility.MenusHidden) return;
@@ -164,6 +182,91 @@ namespace MamboDMA.Games.DayZ
                     cfg.ShowRawDebug = showRawDebug;
 
                 ImGui.Separator();
+                // Top-level: map selection drives both mini radar AND web radar, so it lives outside both.
+                if (ImGui.CollapsingHeader("Map"))
+                {
+                    bool autoMap = cfg.RadarAutoSelectMap;
+                    if (ImGui.Checkbox("Auto-detect map", ref autoMap))
+                        cfg.RadarAutoSelectMap = autoMap;
+
+                    // Auto-resolve drives cfg.RadarSelectedMap from Draw() above; read its result for UI display only.
+                    string detectedWorld = DayZFrameSnapshots.Current.World.WorldName;
+                    MapDef? detected = autoMap ? DayZMapRegistry.ResolveByWorldName(detectedWorld) : null;
+
+                    var maps = DayZMapRegistry.All;
+                    if (maps.Count > 0)
+                    {
+                        int sel = 0;
+                        for (int i = 0; i < maps.Count; i++)
+                            if (string.Equals(maps[i].Key, cfg.RadarSelectedMap, StringComparison.OrdinalIgnoreCase))
+                            { sel = i; break; }
+                        if (autoMap) ImGui.BeginDisabled();
+                        if (ImGui.BeginCombo("Map", maps[sel].Display))
+                        {
+                            for (int i = 0; i < maps.Count; i++)
+                            {
+                                bool selected = (i == sel);
+                                if (ImGui.Selectable(maps[i].Display, selected))
+                                    cfg.RadarSelectedMap = maps[i].Key;
+                                if (selected) ImGui.SetItemDefaultFocus();
+                            }
+                            ImGui.EndCombo();
+                        }
+                        if (autoMap) ImGui.EndDisabled();
+                        if (autoMap && detected == null)
+                        {
+                            string label = string.IsNullOrEmpty(detectedWorld)
+                                ? "Detecting world..."
+                                : $"Unknown world: {detectedWorld} - pick manually";
+                            ImGui.TextDisabled(label);
+                        }
+                    }
+                    else
+                    {
+                        ImGui.TextDisabled("No maps loaded (check Assets/Maps/DayZ/maps.json).");
+                    }
+                }
+
+                if (ImGui.CollapsingHeader("Mini Radar"))
+                {
+                    bool enableMini = cfg.EnableMiniRadar;
+                    if (ImGui.Checkbox("Enable Mini Radar", ref enableMini))
+                        cfg.EnableMiniRadar = enableMini;
+
+                    if (enableMini)
+                    {
+                        bool centerOnSelf = cfg.RadarCenterOnSelf;
+                        if (ImGui.Checkbox("Center On Self", ref centerOnSelf))
+                            cfg.RadarCenterOnSelf = centerOnSelf;
+
+                        float zoom = cfg.RadarZoom;
+                        if (ImGui.SliderFloat("Zoom", ref zoom, 0.25f, 48f, "%.2fx", ImGuiSliderFlags.Logarithmic))
+                            cfg.RadarZoom = zoom;
+
+                        float smooth = cfg.RadarFollowSmoothing;
+                        if (ImGui.SliderFloat("Follow Smoothing", ref smooth, 0f, 1f, "%.2f"))
+                            cfg.RadarFollowSmoothing = smooth;
+
+                        bool aim = cfg.ShowAimlines;
+                        if (ImGui.Checkbox("Show Aimlines", ref aim))
+                            cfg.ShowAimlines = aim;
+
+                        float aimLen = cfg.AimlineLength;
+                        if (ImGui.SliderFloat("Aimline Length (m)", ref aimLen, 1f, 100f, "%.0f"))
+                            cfg.AimlineLength = aimLen;
+
+                        Vector4 aimCol = cfg.AimlineColor;
+                        if (ImGui.ColorEdit4("Aimline Color", ref aimCol))
+                            cfg.AimlineColor = aimCol;
+                    }
+                }
+
+                if (ImGui.CollapsingHeader("Web Radar"))
+                {
+                    WebRadarUI.DrawPanel(_webRadarSource);
+                }
+
+                ImGui.Separator();
 
                 // Start/Stop buttons with safety
                 if (!attached) ImGui.BeginDisabled();
@@ -175,7 +278,9 @@ namespace MamboDMA.Games.DayZ
                 if (!attached) ImGui.EndDisabled();
 
                 ImGui.SameLine();
+                if (!_running) ImGui.BeginDisabled();
                 if (ImGui.Button("Stop Workers")) Stop();
+                if (!_running) ImGui.EndDisabled();
             });
 
             // ─────────────────────────────
@@ -295,7 +400,7 @@ namespace MamboDMA.Games.DayZ
             bool attached = MamboDMA.DmaMemory.IsAttached;
             var frame = DayZFrameSnapshots.Current;
             bool cameraValid = frame.Camera != null;
-            bool localPositionValid = IsFinitePosition(frame.World.LocalPlayerPosition);
+            bool localPositionValid = IsResolvedLocalPosition(frame.World.LocalPlayerPosition);
 
             Logger.Info(
                 $"[DayZ/Render] frames={frames} overlayFps={overlayFps} " +
@@ -345,6 +450,11 @@ namespace MamboDMA.Games.DayZ
                     case EntityType.Ammo:
                     case EntityType.Food:
                         if (cfg.ShowLoot) DrawEntityEsp(e, cfg.ItemColor, cam, snap, cfg, isHuman: false);
+                        else Interlocked.Increment(ref DayZRenderMetrics.RejectCategory);
+                        break;
+                    case EntityType.Car:
+                    case EntityType.Boat:
+                        if (cfg.ShowLoot) DrawEntityEsp(e, cfg.CarColor, cam, snap, cfg, isHuman: false);
                         else Interlocked.Increment(ref DayZRenderMetrics.RejectCategory);
                         break;
                     default:
@@ -428,7 +538,7 @@ namespace MamboDMA.Games.DayZ
             }
 
             Vector3 localPosition = snapshot.LocalPlayerPosition;
-            bool hasDistance = IsFinitePosition(localPosition);
+            bool hasDistance = IsResolvedLocalPosition(localPosition);
             float distance = hasDistance
                 ? Vector3.Distance(localPosition, entity.Position)
                 : 0f;
@@ -505,13 +615,8 @@ namespace MamboDMA.Games.DayZ
         private static string FormatCandidateCount(int count)
             => count >= 0 ? count.ToString() : "unknown";
 
-        // Vector3.Zero means the local-player position has not resolved yet, so it
-        // must not be used for distance filtering even though its components are finite.
-        private static bool IsFinitePosition(Vector3 position)
-            => float.IsFinite(position.X) &&
-               float.IsFinite(position.Y) &&
-               float.IsFinite(position.Z) &&
-               position != Vector3.Zero;
+        private static bool IsResolvedLocalPosition(Vector3 p)
+            => p != Vector3.Zero && float.IsFinite(p.X) && float.IsFinite(p.Y) && float.IsFinite(p.Z);
     }
 
     public sealed class DayZConfig
@@ -534,5 +639,15 @@ namespace MamboDMA.Games.DayZ
         public float DebugDistance { get; set; } = 200f;
 
         public bool ShowRawDebug { get; set; } = false;
+
+        public bool EnableMiniRadar { get; set; } = false;
+        public bool RadarAutoSelectMap { get; set; } = true;
+        public string RadarSelectedMap { get; set; } = "ChernarusPlus";
+        public bool RadarCenterOnSelf { get; set; } = true;
+        public float RadarZoom { get; set; } = 1.0f;
+        public float RadarFollowSmoothing { get; set; } = 0.5f;
+        public bool ShowAimlines { get; set; } = true;
+        public float AimlineLength { get; set; } = 20f;
+        public Vector4 AimlineColor { get; set; } = new(1f, 1f, 0f, 1f);
     }
 }

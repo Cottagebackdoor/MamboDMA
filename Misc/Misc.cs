@@ -27,6 +27,28 @@ namespace MamboDMA
         [DllImport("user32.dll")] static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
         [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll")] static extern bool GetWindowDisplayAffinity(nint hWnd, out uint dwAffinity);
+        [DllImport("user32.dll")] static extern int GetSystemMetrics(int nIndex);
+
+        private const int SM_CXSCREEN = 0;
+        private const int SM_CYSCREEN = 1;
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+
+        // Covers the Windows taskbar: positions overlay at (0,0) sized to full primary monitor (not work area) and pins it topmost.
+        public static unsafe void CoverTaskbarPrimaryMonitor()
+        {
+            nint hwnd = (nint)Raylib.GetWindowHandle();
+            if (hwnd == IntPtr.Zero) return;
+            int w = GetSystemMetrics(SM_CXSCREEN);
+            int h = GetSystemMetrics(SM_CYSCREEN);
+            if (w <= 0 || h <= 0) return;
+            try
+            {
+                Raylib.SetWindowPosition(0, 0);
+                Raylib.SetWindowSize(w, h);
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, w, h, SWP_FRAMECHANGED);
+            }
+            catch { }
+        }
 
         [DllImport("user32.dll")]
         private static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);

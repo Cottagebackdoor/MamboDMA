@@ -102,6 +102,8 @@ namespace MamboDMA.Games.DayZ
             // Transform starts at +0x8, so this is offset +0x24 within it.
             public const ulong Position = 0x2C;
             public const ulong PositionWithinTransform = Position - Transform;
+            // Bohemia 3x4 transform: rows are right(+0x0), up(+0xC), forward(+0x18), translation(+0x24).
+            public const ulong Forward = 0x20;
         }
 
         public static class Camera

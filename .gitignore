@@ -2,6 +2,9 @@
 /.vs/MamboDMA/v17
 /.vs/MamboDMA/v18
 /.vs
-/bin
-/obj
+bin/
+obj/
 /docs/
+
+# DayZ map PNGs exceed GitHub's 100MB per-file limit; distribute separately (NAS / dayz-dma-cpp/mapcontent/).
+Assets/Maps/DayZ/*.png

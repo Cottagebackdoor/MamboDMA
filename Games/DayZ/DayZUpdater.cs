@@ -42,6 +42,8 @@ namespace MamboDMA.Games.DayZ
         private static long _nextErrorDiagnostic;
         private static long _nextFrameDiagnostic;
         private static long _nextLocalPlayerProbe;
+        private static long _nextWorldNameProbe;
+        private static string _cachedWorldName = "";
         private static long _entityPass;
         private static long _framesPublished;
         // Written and read only on the WorldLoop thread (via BuildWorldSnapshot → ResolveLocalPlayer).
@@ -251,6 +253,8 @@ namespace MamboDMA.Games.DayZ
             Interlocked.Exchange(ref _entityPass, 0);
             Interlocked.Exchange(ref _framesPublished, 0);
             Interlocked.Exchange(ref _nextLocalPlayerProbe, 0);
+            Interlocked.Exchange(ref _nextWorldNameProbe, 0);
+            _cachedWorldName = "";
             Interlocked.Exchange(ref _nextFrameDiagnostic, 0);
             Interlocked.Exchange(ref _worldPasses, 0);
             Interlocked.Exchange(ref _cameraPasses, 0);
@@ -303,6 +307,7 @@ namespace MamboDMA.Games.DayZ
                 bool worldOk = false;
                 try
                 {
+                    MaybeRefreshWorldName();
                     var snapshot = BuildWorldSnapshot();
                     lock (_frameLock) { _latestWorld = snapshot; }
                     RepublishFrame();
@@ -459,6 +464,7 @@ namespace MamboDMA.Games.DayZ
                 Players = playerCount,
                 Zombies = zombieCount,
                 Cars = carCount,
+                WorldName = _cachedWorldName,
             };
         }
 
@@ -866,6 +872,10 @@ namespace MamboDMA.Games.DayZ
                                 state.VisualStatePointer + DayZOffsets.VisualState.Position);
                             if (state.PositionPrepared)
                                 preparedPositionOperations++;
+                            state.ForwardPrepared = positionScatter.PrepareReadValue<Vector3>(
+                                state.VisualStatePointer + DayZOffsets.VisualState.Forward);
+                            if (state.ForwardPrepared)
+                                preparedPositionOperations++;
                         }
                         metrics.PositionsPrepared += preparedPositionOperations;
                         metrics.PrepareMs += Stopwatch.GetElapsedTime(
@@ -1007,6 +1017,18 @@ namespace MamboDMA.Games.DayZ
                         entity.CleanNamePtr,
                         entity.Category));
                 }
+            }
+
+            if (state.ForwardPrepared &&
+                positionScatter is not null &&
+                positionScatter.ReadValue(
+                    state.VisualStatePointer + DayZOffsets.VisualState.Forward,
+                    out Vector3 forward) &&
+                IsFinite(forward) &&
+                forward != Vector3.Zero)
+            {
+                entity.Forward = forward;
+                entity.HasForward = true;
             }
 
             bool primaryPositionOk =
@@ -1749,6 +1771,8 @@ namespace MamboDMA.Games.DayZ
             public string CleanName = "";
             public EntityType Category = EntityType.None;
             public Vector3 Position;
+            public Vector3 Forward;
+            public bool HasForward;
             public bool IsDead;
             public bool IsValid;
             public string PositionReadMode = "";
@@ -2222,6 +2246,74 @@ namespace MamboDMA.Games.DayZ
             return true;
         }
 
+        // World-name string is stored deeper than the Landscape/World pointers themselves; scan a small window for the first plausible ASCII map identifier.
+        private static void MaybeRefreshWorldName()
+        {
+            if (!ShouldLog(ref _nextWorldNameProbe, 10_000))
+                return;
+
+            ulong moduleBase = DmaMemory.Base;
+            if (!DmaMemory.IsAttached || moduleBase == 0)
+                return;
+
+            if (TryReadWorldNameFromPointer(moduleBase + DayZOffsets.Module.Landscape, "Landscape", out string name) ||
+                TryReadWorldNameFromPointer(moduleBase + DayZOffsets.Module.World, "World", out name))
+            {
+                if (!string.Equals(name, _cachedWorldName, StringComparison.Ordinal))
+                {
+                    Logger.Info($"[DayZ/World] worldName=\"{name}\" cachedWas=\"{_cachedWorldName}\"");
+                    _cachedWorldName = name;
+                }
+            }
+        }
+
+        private static bool TryReadWorldNameFromPointer(ulong moduleField, string source, out string name)
+        {
+            name = "";
+            if (!TryReadPointer(moduleField, out ulong root))
+                return false;
+
+            byte[]? buffer;
+            try
+            {
+                buffer = DmaMemory.ReadBytes(root, 0x400);
+            }
+            catch
+            {
+                return false;
+            }
+            if (buffer is null || buffer.Length < 4)
+                return false;
+
+            for (int start = 0; start < buffer.Length; start++)
+            {
+                int end = start;
+                while (end < buffer.Length && buffer[end] != 0) end++;
+                int len = end - start;
+                if (len >= 3 && len <= 32 && IsPlausibleWorldName(buffer, start, len))
+                {
+                    name = Encoding.ASCII.GetString(buffer, start, len);
+                    Logger.Info($"[DayZ/World] source={source} root=0x{root:X} offset=0x{start:X} name=\"{name}\"");
+                    return true;
+                }
+                start = end;
+            }
+            return false;
+        }
+
+        private static bool IsPlausibleWorldName(byte[] buffer, int start, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                byte b = buffer[start + i];
+                bool ok = (b >= (byte)'a' && b <= (byte)'z') ||
+                          (b >= (byte)'0' && b <= (byte)'9') ||
+                          b == (byte)'_';
+                if (!ok) return false;
+            }
+            return true;
+        }
+
         private static void MaybeLogWorldSnapshot(DayZSnapshot snapshot)
         {
             if (!ShouldLog(ref _nextWorldDiagnostic, DiagnosticIntervalMs))
@@ -2558,6 +2650,7 @@ namespace MamboDMA.Games.DayZ
             public bool IsDead { get; set; }
             public bool UsedFutureVisualState { get; set; }
             public bool PositionPrepared { get; set; }
+            public bool ForwardPrepared { get; set; }
         }
 
         private sealed class EntityScatterMetrics

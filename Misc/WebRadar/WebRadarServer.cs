@@ -1,4 +1,5 @@
-// File: Games/ABI/WebRadarServer.cs
+#nullable disable warnings
+
 using System;
 using System.IO;
 using System.Net;
@@ -7,11 +8,15 @@ using System.Threading;
 using System.Collections.Generic;
 using System.Numerics;
 using ImGuiNET;
+using MamboDMA.Games.Common;
+using MamboDMA.Games.ABI; // UpnpMapper lives in this namespace (file Misc/UPNPMapper.cs)
 
-namespace MamboDMA.Games.ABI
+namespace MamboDMA.WebRadar
 {
 internal sealed class WebRadarServer : IDisposable
 {
+    public IWebRadarFrameSource? FrameSource { get; set; }
+
 private HttpListener _http;
 private Thread _acceptThread;
 private Thread _broadcastThread;
@@ -137,7 +142,7 @@ private readonly object _clientsLock = new();
         try { _acceptThread?.Join(500); } catch { }
         try { _broadcastThread?.Join(500); } catch { }
         try { _upnp?.Dispose(); _upnp = null; ExternalUrl = null; } catch { }
-        
+
         Console.WriteLine("[WebRadar] Server stopped");
     }
 
@@ -175,14 +180,8 @@ private readonly object _clientsLock = new();
             if (path.Equals("/ping", StringComparison.OrdinalIgnoreCase)) { HandlePing(ctx); continue; }
             if (path.Equals("/status", StringComparison.OrdinalIgnoreCase)) { HandleStatus(ctx); continue; }
             if (path.Equals("/api/maps", StringComparison.OrdinalIgnoreCase)) { HandleApiMaps(ctx); continue; }
-            if (path.StartsWith("/api/mapcfg/", StringComparison.OrdinalIgnoreCase)) { HandleApiMapCfg(ctx); continue; }
-
-            if (ctx.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase)
-                && path.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
-            {
-                HandleSidecarPut(ctx);
-                continue;
-            }
+            if (path.StartsWith("/api/mapsidecar/", StringComparison.OrdinalIgnoreCase)) { HandleApiMapSidecar(ctx); continue; }
+            if (path.StartsWith("/maps/", StringComparison.Ordinal)) { HandleMapImage(ctx); continue; }
 
             HandleStatic(ctx);
         }
@@ -197,7 +196,6 @@ private readonly object _clientsLock = new();
             ctx.Response.ContentLength64 = msg.Length;
             ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
             ctx.Response.OutputStream.Write(msg, 0, msg.Length);
-            Console.WriteLine("[WebRadar] /ping responded");
         }
         catch { }
         finally { SafeClose(ctx); }
@@ -230,7 +228,7 @@ private readonly object _clientsLock = new();
 
     private void HandleApiFrame(HttpListenerContext ctx)
     {
-        string json = BuildFrameJson();
+        string json = FrameSource?.BuildFrameJson() ?? "{\"ok\":false}";
         try
         {
             byte[] buf = Encoding.UTF8.GetBytes(json);
@@ -238,7 +236,6 @@ private readonly object _clientsLock = new();
             ctx.Response.ContentLength64 = buf.Length;
             ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
             ctx.Response.OutputStream.Write(buf, 0, buf.Length);
-            Console.WriteLine($"[WebRadar] /api/frame responded ({buf.Length} bytes)");
         }
         catch { }
         finally { SafeClose(ctx); }
@@ -248,38 +245,21 @@ private readonly object _clientsLock = new();
     {
         try
         {
-            string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "WebRadar");
-            var list = new List<object>();
-
-            static void AddFromDir(string dir, string urlPrefix, List<object> outList)
+            if (FrameSource == null)
             {
-                if (!Directory.Exists(dir)) return;
-                foreach (var path in Directory.EnumerateFiles(dir, "*.*", SearchOption.TopDirectoryOnly))
-                {
-                    var ext = Path.GetExtension(path)?.ToLowerInvariant();
-                    if (ext is not (".png" or ".jpg" or ".jpeg")) continue;
-
-                    var name = Path.GetFileNameWithoutExtension(path);
-                    var file = Path.GetFileName(path);
-                    var url = $"{urlPrefix}{file}";
-                    outList.Add(new { name, file, url });
-                }
+                Console.WriteLine("[WebRadar] /api/maps requested but FrameSource is null; returning empty list");
+                var empty = Encoding.UTF8.GetBytes("[]");
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                ctx.Response.ContentLength64 = empty.Length;
+                ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
+                ctx.Response.OutputStream.Write(empty, 0, empty.Length);
+                return;
             }
 
-            AddFromDir(root, "/", list);
-
-            if (list.Count == 0)
-            {
-                var mapsDir = Path.Combine(root, "Maps");
-                AddFromDir(mapsDir, "/Maps/", list);
-            }
-
-            list.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(
-                (string)a.GetType().GetProperty("name")!.GetValue(a)!,
-                (string)b.GetType().GetProperty("name")!.GetValue(b)!
-            ));
-
-            var json = System.Text.Json.JsonSerializer.Serialize(list);
+            var src = FrameSource.ListMaps();
+            var arr = new List<object>(src.Count);
+            foreach (var m in src) arr.Add(new { name = m.Name, file = m.File, url = m.Url });
+            var json = System.Text.Json.JsonSerializer.Serialize(arr);
             var buf = Encoding.UTF8.GetBytes(json);
             ctx.Response.ContentType = "application/json; charset=utf-8";
             ctx.Response.ContentLength64 = buf.Length;
@@ -297,47 +277,41 @@ private readonly object _clientsLock = new();
         finally { SafeClose(ctx); }
     }
 
-    private void HandleApiMapCfg(HttpListenerContext ctx)
+    private void HandleApiMapSidecar(HttpListenerContext ctx)
     {
         try
         {
-            if (!ctx.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            string p = ctx.Request.Url!.AbsolutePath;
+            string key = Uri.UnescapeDataString(p.Substring("/api/mapsidecar/".Length).Trim('/'));
+            if (key.Length == 0 || key.Contains("..")) { ctx.Response.StatusCode = 400; return; }
+
+            if (ctx.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase))
             {
-                ctx.Response.StatusCode = 405;
+                string body;
+                using (var sr = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding ?? Encoding.UTF8))
+                    body = sr.ReadToEnd();
+                bool ok = FrameSource?.TrySaveMapSidecar(key, body) ?? false;
+                ctx.Response.StatusCode = ok ? 200 : 500;
                 ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
+                var msg = Encoding.UTF8.GetBytes(ok ? "{\"ok\":true}" : "{\"ok\":false}");
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                ctx.Response.ContentLength64 = msg.Length;
+                ctx.Response.OutputStream.Write(msg, 0, msg.Length);
                 return;
             }
 
-            string body;
-            using (var sr = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding ?? Encoding.UTF8))
-                body = sr.ReadToEnd();
-
-            var payload = System.Text.Json.JsonDocument.Parse(body).RootElement;
-
-            string dir  = payload.TryGetProperty("dir", out var d) ? d.GetString() ?? "" : "";
-            string name = payload.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
-            var cfgElem = payload.TryGetProperty("config", out var c) ? c : default;
-
-            if (string.IsNullOrWhiteSpace(name) || cfgElem.ValueKind == System.Text.Json.JsonValueKind.Undefined)
+            string? json = FrameSource?.GetMapSidecarJson(key);
+            if (json == null)
             {
-                ctx.Response.StatusCode = 400;
+                ctx.Response.StatusCode = 404;
                 ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
                 return;
             }
-
-            string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "WebRadar");
-            string subdir = SafeJoinUrlDir(root, dir);
-            Directory.CreateDirectory(subdir);
-
-            string target = Path.Combine(subdir, $"{SanitizeFileName(name)}.json");
-            var json = System.Text.Json.JsonSerializer.Serialize(cfgElem, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(target, json, new UTF8Encoding(false));
-
-            var ok = Encoding.UTF8.GetBytes("{\"ok\":true}");
+            var buf = Encoding.UTF8.GetBytes(json);
             ctx.Response.ContentType = "application/json; charset=utf-8";
-            ctx.Response.ContentLength64 = ok.Length;
+            ctx.Response.ContentLength64 = buf.Length;
             ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
-            ctx.Response.OutputStream.Write(ok, 0, ok.Length);
+            ctx.Response.OutputStream.Write(buf, 0, buf.Length);
         }
         catch
         {
@@ -347,48 +321,31 @@ private readonly object _clientsLock = new();
         finally { SafeClose(ctx); }
     }
 
-    private void HandleSidecarPut(HttpListenerContext ctx)
+    private void HandleMapImage(HttpListenerContext ctx)
     {
         try
         {
-            if (!ctx.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase))
+            string rel = ctx.Request.Url!.AbsolutePath.Substring("/maps/".Length);
+            rel = Uri.UnescapeDataString(rel).Replace('\\', '/').TrimStart('/');
+            if (rel.Length == 0 || rel.Contains("..")) { ctx.Response.StatusCode = 400; return; }
+
+            string? full = FrameSource?.GetMapImagePath(rel);
+            if (full == null || !File.Exists(full))
             {
-                ctx.Response.StatusCode = 405;
+                ctx.Response.StatusCode = 404;
                 ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
                 return;
             }
 
-            string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "WebRadar");
-            string relUrl = (ctx.Request.Url?.AbsolutePath ?? "/").TrimStart('/');
-
-            if (relUrl.Contains("..")) { ctx.Response.StatusCode = 400; ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*"); return; }
-
-            string full = Path.GetFullPath(Path.Combine(root, relUrl));
-            if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-            {
-                ctx.Response.StatusCode = 403;
-                ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
-                return;
-            }
-
-            Directory.CreateDirectory(Path.GetDirectoryName(full)!);
-
-            using (var fs = new FileStream(full, FileMode.Create, FileAccess.Write, FileShare.None))
-            {
-                ctx.Request.InputStream.CopyTo(fs);
-            }
-
-            ctx.Response.StatusCode = 200;
+            byte[] data = File.ReadAllBytes(full);
+            ctx.Response.ContentType = GuessMime(Path.GetExtension(full));
+            ctx.Response.ContentLength64 = data.Length;
             ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
-            var ok = Encoding.UTF8.GetBytes("{\"ok\":true}");
-            ctx.Response.ContentType = "application/json; charset=utf-8";
-            ctx.Response.ContentLength64 = ok.Length;
-            ctx.Response.OutputStream.Write(ok, 0, ok.Length);
+            ctx.Response.OutputStream.Write(data, 0, data.Length);
         }
         catch
         {
             ctx.Response.StatusCode = 500;
-            ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
         }
         finally { SafeClose(ctx); }
     }
@@ -451,11 +408,11 @@ private readonly object _clientsLock = new();
         Console.WriteLine("[WebRadar] BroadcastLoop started");
         var sw = new System.Diagnostics.Stopwatch();
         int frameCount = 0;
-        
+
         while (_running)
         {
             sw.Restart();
-            string payload = BuildFrameJson();
+            string payload = FrameSource?.BuildFrameJson() ?? "{\"ok\":false}";
             frameCount++;
 
             if (frameCount % 100 == 0)
@@ -478,228 +435,8 @@ private readonly object _clientsLock = new();
             int sleep = targetMs - (int)sw.ElapsedMilliseconds;
             if (sleep > 0) Thread.Sleep(sleep);
         }
-        
+
         Console.WriteLine("[WebRadar] BroadcastLoop ended");
-    }
-
-    private string BuildFrameJson()
-    {
-        bool frameOk = Players.TryGetFrame(out var fr);
-        
-        if (!frameOk || fr.Positions == null)
-        {
-            return "{\"ok\":false}";
-        }
-
-        float yawDeg = Players.CtrlYaw;
-        ulong sessionId = Players.PersistentLevel;
-        float camFov = fr.Cam.Fov;
-
-        List<Players.ABIPlayer> actors;
-        lock (Players.Sync)
-            actors = Players.ActorList.Count > 0 ? new List<Players.ABIPlayer>(Players.ActorList) : new();
-
-        var inv = System.Globalization.CultureInfo.InvariantCulture;
-        var sb = new System.Text.StringBuilder(1 << 15);
-
-        // **CRITICAL FIX: Properly escape JSON strings**
-        string EscapeJsonString(string str)
-        {
-            if (string.IsNullOrEmpty(str)) return "";
-            
-            var escaped = new System.Text.StringBuilder(str.Length + 10);
-            foreach (char c in str)
-            {
-                switch (c)
-                {
-                    case '\"': escaped.Append("\\\""); break;
-                    case '\\': escaped.Append("\\\\"); break;
-                    case '\b': escaped.Append("\\b"); break;
-                    case '\f': escaped.Append("\\f"); break;
-                    case '\n': escaped.Append("\\n"); break;
-                    case '\r': escaped.Append("\\r"); break;
-                    case '\t': escaped.Append("\\t"); break;
-                    default:
-                        if (c < 0x20 || c > 0x7E)
-                            escaped.AppendFormat("\\u{0:X4}", (int)c);
-                        else
-                            escaped.Append(c);
-                        break;
-                }
-            }
-            return escaped.ToString();
-        }
-
-        // **CRITICAL FIX: Sanitize floats**
-        string SafeFloat(float value)
-        {
-            if (float.IsNaN(value) || float.IsInfinity(value))
-                return "0";
-            return value.ToString("0.###", inv);
-        }
-
-        sb.Append("{\"ok\":true");
-        sb.Append(",\"session\":"); sb.Append(sessionId.ToString());
-        sb.Append(",\"fov\":"); sb.Append(SafeFloat(camFov));
-
-        sb.Append(",\"self\":{");
-        sb.Append("\"x\":"); sb.Append(SafeFloat(fr.Local.X));
-        sb.Append(",\"y\":"); sb.Append(SafeFloat(fr.Local.Y));
-        sb.Append(",\"z\":"); sb.Append(SafeFloat(fr.Local.Z));
-        sb.Append(",\"yaw\":"); sb.Append(SafeFloat(yawDeg));
-        sb.Append('}');
-
-        var posMap = new Dictionary<ulong, Players.ActorPos>(fr.Positions.Count);
-        for (int i = 0; i < fr.Positions.Count; i++) posMap[fr.Positions[i].Pawn] = fr.Positions[i];
-
-        // Actors
-        sb.Append(",\"actors\":[");
-        bool first = true;
-        int actorsSent = 0;
-        
-        for (int i = 0; i < actors.Count; i++)
-        {
-            var a = actors[i];
-            if (!posMap.TryGetValue(a.Pawn, out var ap)) continue;
-
-            // Skip actors with invalid positions
-            if (float.IsNaN(ap.Position.X) || float.IsNaN(ap.Position.Y) || float.IsNaN(ap.Position.Z))
-                continue;
-            if (float.IsInfinity(ap.Position.X) || float.IsInfinity(ap.Position.Y) || float.IsInfinity(ap.Position.Z))
-                continue;
-
-            if (!first) sb.Append(',');
-            first = false;
-            actorsSent++;
-
-            sb.Append('{');
-            sb.Append("\"x\":"); sb.Append(SafeFloat(ap.Position.X));
-            sb.Append(",\"y\":"); sb.Append(SafeFloat(ap.Position.Y));
-            sb.Append(",\"z\":"); sb.Append(SafeFloat(ap.Position.Z));
-            sb.Append(",\"dead\":"); sb.Append(ap.IsDead ? "true" : "false");
-            sb.Append(",\"bot\":"); sb.Append(a.IsBot ? "true" : "false");
-            sb.Append(",\"pawn\":\"0x"); sb.Append(a.Pawn.ToString("X")); sb.Append('\"');
-            sb.Append('}');
-        }
-        sb.Append(']');
-
-        // Loot items
-        int lootSent = 0, containersSent = 0;
-        
-        if (ABILoot.TryGetLoot(out var lootFrame) && lootFrame.Items != null)
-        {
-            sb.Append(",\"loot\":[");
-            first = true;
-
-            foreach (var item in lootFrame.Items)
-            {
-                if (item.InContainer) continue;
-
-                // Skip items with invalid positions
-                if (float.IsNaN(item.Position.X) || float.IsNaN(item.Position.Y) || float.IsNaN(item.Position.Z))
-                    continue;
-                if (float.IsInfinity(item.Position.X) || float.IsInfinity(item.Position.Y) || float.IsInfinity(item.Position.Z))
-                    continue;
-
-                if (!first) sb.Append(',');
-                first = false;
-                lootSent++;
-
-                sb.Append('{');
-                sb.Append("\"x\":"); sb.Append(SafeFloat(item.Position.X));
-                sb.Append(",\"y\":"); sb.Append(SafeFloat(item.Position.Y));
-                sb.Append(",\"z\":"); sb.Append(SafeFloat(item.Position.Z));
-
-                // **CRITICAL FIX: Use EscapeJsonString for item names**
-                string itemName = item.Label ?? item.ClassName ?? "Item";
-                sb.Append(",\"name\":\"");
-                sb.Append(EscapeJsonString(itemName));
-                sb.Append('\"');
-
-                if (item.ApproxPrice > 0)
-                {
-                    sb.Append(",\"price\":");
-                    sb.Append(item.ApproxPrice);
-                }
-
-                if (item.Rarity > 0)
-                {
-                    sb.Append(",\"rarity\":");
-                    sb.Append(item.Rarity);
-                }
-
-                sb.Append('}');
-            }
-            sb.Append(']');
-
-            // Containers
-            var containerGroups = new Dictionary<ulong, (Vector3 pos, int count, int totalValue)>();
-            foreach (var item in lootFrame.Items)
-            {
-                if (!item.InContainer || item.ContainerActor == 0) continue;
-
-                // Skip containers with invalid positions
-                if (float.IsNaN(item.Position.X) || float.IsNaN(item.Position.Y) || float.IsNaN(item.Position.Z))
-                    continue;
-
-                if (!containerGroups.TryGetValue(item.ContainerActor, out var existing))
-                {
-                    containerGroups[item.ContainerActor] = (item.Position, 1, item.ApproxPrice);
-                }
-                else
-                {
-                    containerGroups[item.ContainerActor] = (
-                        existing.pos,
-                        existing.count + 1,
-                        existing.totalValue + item.ApproxPrice
-                    );
-                }
-            }
-
-            sb.Append(",\"containers\":[");
-            first = true;
-            foreach (var kvp in containerGroups)
-            {
-                if (!first) sb.Append(',');
-                first = false;
-                containersSent++;
-
-                sb.Append('{');
-                sb.Append("\"x\":"); sb.Append(SafeFloat(kvp.Value.pos.X));
-                sb.Append(",\"y\":"); sb.Append(SafeFloat(kvp.Value.pos.Y));
-                sb.Append(",\"z\":"); sb.Append(SafeFloat(kvp.Value.pos.Z));
-                sb.Append(",\"count\":");
-                sb.Append(kvp.Value.count);
-
-                if (kvp.Value.totalValue > 0)
-                {
-                    sb.Append(",\"totalValue\":");
-                    sb.Append(kvp.Value.totalValue);
-                }
-
-                sb.Append(",\"actor\":\"0x");
-                sb.Append(kvp.Key.ToString("X"));
-                sb.Append('\"');
-                sb.Append('}');
-            }
-            sb.Append(']');
-        }
-        else
-        {
-            sb.Append(",\"loot\":[]");
-            sb.Append(",\"containers\":[]");
-        }
-
-        if (!string.IsNullOrEmpty(ExternalIp))
-        {
-            sb.Append(",\"publicIp\":\""); 
-            sb.Append(EscapeJsonString(ExternalIp)); 
-            sb.Append('\"');
-        }
-
-        sb.Append('}');
-        
-        return sb.ToString();
     }
 
     private static void SafeClose(HttpListenerContext ctx)
@@ -718,10 +455,12 @@ private readonly object _clientsLock = new();
             var ipsJson = string.Join(",", Array.ConvertAll(ipStrings, s => $"\"{s}\""));
 
             string publicUrl = GetPublicUrl() ?? (string.IsNullOrEmpty(ExternalIp) ? null : $"http://{ExternalIp}:{Port}/");
+            string gameField = FrameSource == null ? "null" : $"\"{FrameSource.GameKey}\"";
 
             string json = "{"
                 + $"\"listening\":true"
                 + $",\"prefix\":\"{Prefix}\""
+                + $",\"game\":{gameField}"
                 + $",\"externalUrl\":{(string.IsNullOrEmpty(ExternalUrl) ? "null" : $"\"{ExternalUrl}\"")}"
                 + $",\"publicIp\":{(string.IsNullOrEmpty(ExternalIp) ? "null" : $"\"{ExternalIp}\"")}"
                 + $",\"publicUrl\":{(string.IsNullOrEmpty(publicUrl) ? "null" : $"\"{publicUrl}\"")}"
@@ -781,25 +520,6 @@ private readonly object _clientsLock = new();
             }
         }
         catch { /* ignore */ }
-    }
-
-    private static string SanitizeFileName(string s)
-    {
-        foreach (var ch in Path.GetInvalidFileNameChars())
-            s = s.Replace(ch, '_');
-        return s;
-    }
-
-    private static string SafeJoinUrlDir(string root, string urlDir)
-    {
-        var clean = (urlDir ?? "").Replace('\\', '/');
-        clean = clean.Trim();
-        if (clean.StartsWith("/")) clean = clean[1..];
-        if (clean.Contains("..")) clean = clean.Replace("..", "");
-        var full = Path.GetFullPath(Path.Combine(root, clean));
-        if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("path escape");
-        return full;
     }
 
     private sealed class SseClient : IDisposable
@@ -875,11 +595,10 @@ internal static class WebRadarUI
     private static string _lastStatus = "";
     private static bool _enableUpnp = false;
     private static bool _bindAll = false;
-    private static bool _showDebugWindow = false;
-    private static string _lastFrameJson = "";
-    private static DateTime _lastFrameTime = DateTime.MinValue;
 
-    public static void DrawPanel()
+    public static void DrawPanel() => DrawPanel(null);
+
+    public static void DrawPanel(IWebRadarFrameSource? source)
     {
         ImGui.Text("Web Radar");
         ImGui.PushItemWidth(100);
@@ -890,10 +609,10 @@ internal static class WebRadarUI
         ImGui.Checkbox("UPnP/NAT-PMP port forward", ref _enableUpnp);
         ImGui.SameLine();
         ImGui.Checkbox("LAN/Internet access (bind 0.0.0.0)", ref _bindAll);
-        
+
         if (_enableUpnp && !_bindAll)
-            ImGui.TextColored(new Vector4(1f, .8f, .2f, 1f), "UPnP is on, but server will bind to localhost only ¡ª external access will still fail.");
-        
+            ImGui.TextColored(new Vector4(1f, .8f, .2f, 1f), "UPnP is on, but server will bind to localhost only â€” external access will still fail.");
+
         bool running = _srv != null && _srv.IsRunning;
 
         if (!running)
@@ -904,6 +623,7 @@ internal static class WebRadarUI
                 {
                     _srv?.Dispose();
                     _srv = new WebRadarServer(_port, enableUpnp: _enableUpnp, bindAll: _bindAll);
+                    _srv.FrameSource = source;
                     _srv.SetRate(_rate);
                     _srv.Start();
                     _lastStatus = $"Running at {_srv.Prefix}";
@@ -969,7 +689,7 @@ internal static class WebRadarUI
                     ImGui.SameLine();
                     if (ImGui.SmallButton("Refresh"))
                     {
-                        _lastStatus = "Refreshing public IP¡­";
+                        _lastStatus = "Refreshing public IPâ€¦";
                         _srv.TriggerExternalIpRefresh();
                     }
                 }
@@ -978,7 +698,7 @@ internal static class WebRadarUI
                     if (!string.IsNullOrEmpty(_srv.LastError))
                         ImGui.TextColored(new Vector4(1f, 0.6f, 0.6f, 1f), $"UPnP/Probe: {_srv.LastError}");
                     else
-                        ImGui.TextColored(new Vector4(0.9f, 0.9f, 0.6f, 1f), "Determining public IP¡­ (will show here if reachable)");
+                        ImGui.TextColored(new Vector4(0.9f, 0.9f, 0.6f, 1f), "Determining public IPâ€¦ (will show here if reachable)");
                 }
             }
         }
@@ -992,150 +712,10 @@ internal static class WebRadarUI
         }
 
         ImGui.Separator();
-        
+
         if (ImGui.Button("Test /ping")) TryOpen($"http://localhost:{_port}/ping");
         ImGui.SameLine();
         if (ImGui.Button("Test /api/frame")) TryOpen($"http://localhost:{_port}/api/frame");
-        ImGui.SameLine();
-        if (ImGui.Button("Show Debug Window"))
-            _showDebugWindow = !_showDebugWindow;
-        ImGui.SameLine();
-        if (ImGui.Button("Copy Last Frame JSON"))
-        {
-            if (!string.IsNullOrEmpty(_lastFrameJson))
-            {
-                ImGui.SetClipboardText(_lastFrameJson);
-                _lastStatus = "JSON copied to clipboard";
-            }
-        }
-        
-        if (_showDebugWindow)
-            DrawDebugWindow();
-    }
-
-    private static void DrawDebugWindow()
-    {
-        ImGui.SetNextWindowSize(new Vector2(900, 650), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin("WebRadar Debug", ref _showDebugWindow))
-        {
-            ImGui.End();
-            return;
-        }
-        
-        ImGui.TextColored(new Vector4(1f, 0.8f, 0.2f, 1f), "DATA FLOW DIAGNOSTICS");
-        ImGui.Separator();
-        
-        bool hasFrame = Players.TryGetFrame(out var fr);
-        DrawStatusIndicator("Players.TryGetFrame", hasFrame);
-        
-        if (hasFrame)
-        {
-            ImGui.Indent();
-            ImGui.Text($"Positions: {fr.Positions?.Count ?? 0}");
-            ImGui.Text($"Local Pos: ({fr.Local.X:F1}, {fr.Local.Y:F1}, {fr.Local.Z:F1})");
-            ImGui.Text($"Camera FOV: {fr.Cam.Fov:F1}");
-            ImGui.Unindent();
-        }
-        
-        ImGui.Separator();
-        
-        bool hasLoot = ABILoot.TryGetLoot(out var lootFrame);
-        DrawStatusIndicator("ABILoot.TryGetLoot", hasLoot);
-        
-        if (hasLoot)
-        {
-            ImGui.Indent();
-            ImGui.Text($"Items: {lootFrame.Items?.Count ?? 0}");
-            ImGui.Text($"Containers: {lootFrame.ContainersFound}");
-            ImGui.Unindent();
-        }
-        
-        ImGui.Separator();
-        
-        int actorCount;
-        lock (Players.Sync)
-            actorCount = Players.ActorList.Count;
-        
-        ImGui.Text($"Players.ActorList.Count: {actorCount}");
-        DrawStatusIndicator("Has Actors", actorCount > 0);
-        
-        ImGui.Separator();
-        
-        if (_srv != null && _srv.IsRunning)
-        {
-            ImGui.TextColored(new Vector4(0, 0.8f, 0, 1), "? Server Running");
-            ImGui.Text($"Prefix: {_srv.Prefix}");
-            
-            if (ImGui.Button("Generate Test Frame NOW"))
-            {
-                _lastFrameJson = GenerateTestFrame();
-                _lastFrameTime = DateTime.Now;
-            }
-            
-            ImGui.SameLine();
-            ImGui.Text($"Last: {(DateTime.Now - _lastFrameTime).TotalSeconds:F1}s ago");
-            
-            if (!string.IsNullOrEmpty(_lastFrameJson))
-            {
-                ImGui.Separator();
-                ImGui.TextColored(new Vector4(0.7f, 0.9f, 1f, 1f), "Last Generated Frame:");
-                
-                ImGui.PushStyleColor(ImGuiCol.FrameBg, new Vector4(0.1f, 0.1f, 0.1f, 1f));
-                ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.9f, 0.9f, 0.9f, 1f));
-                
-                string preview = _lastFrameJson.Length > 800 
-                    ? _lastFrameJson.Substring(0, 800) + "\n\n... (truncated, click 'Copy' for full JSON)" 
-                    : _lastFrameJson;
-                
-                ImGui.InputTextMultiline("##json", ref preview, (uint)preview.Length, 
-                    new Vector2(-1, 300), ImGuiInputTextFlags.ReadOnly);
-                
-                ImGui.PopStyleColor(2);
-                
-                if (ImGui.Button("Copy Full JSON"))
-                {
-                    ImGui.SetClipboardText(_lastFrameJson);
-                    _lastStatus = $"Copied {_lastFrameJson.Length} bytes to clipboard";
-                }
-            }
-        }
-        else
-        {
-            ImGui.TextColored(new Vector4(1, 0.3f, 0, 1), "? Server Not Running");
-            ImGui.Text("Start the server to see frame data");
-        }
-        
-        ImGui.End();
-    }
-
-    private static void DrawStatusIndicator(string label, bool ok)
-    {
-        var col = ok ? new Vector4(0, 0.8f, 0, 1) : new Vector4(1, 0.3f, 0, 1);
-        var icon = ok ? "?" : "?";
-        ImGui.TextColored(col, $"{icon} {label}");
-    }
-
-    private static string GenerateTestFrame()
-    {
-        if (_srv == null) return "Server not initialized";
-        
-        var method = typeof(WebRadarServer).GetMethod("BuildFrameJson", 
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        
-        if (method != null)
-        {
-            try
-            {
-                var result = method.Invoke(_srv, null);
-                return result?.ToString() ?? "null";
-            }
-            catch (Exception ex)
-            {
-                return $"Error: {ex.Message}\n{ex.StackTrace}";
-            }
-        }
-        
-        return "BuildFrameJson method not found";
     }
 
     private static void RenderUrlRow(string url)

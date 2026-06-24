@@ -40,6 +40,7 @@ namespace MamboDMA.Games.DayZ
         public required int Players { get; init; }
         public required int Zombies { get; init; }
         public required int Cars { get; init; }
+        public required string WorldName { get; init; }
 
         public static DayZSnapshot Empty { get; } = new()
         {
@@ -73,6 +74,7 @@ namespace MamboDMA.Games.DayZ
             Players = 0,
             Zombies = 0,
             Cars = 0,
+            WorldName = "",
         };
     }
 

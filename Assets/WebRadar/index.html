@@ -6,7 +6,7 @@
   <title>MamboDMA Web Radar</title>
   <link rel="stylesheet" href="radar.css"/>
 </head>
-<body>
+<body class="game-abi">
   <div id="app">
     <header id="toolbar" class="expanded">
       <div id="toolbar-top">
@@ -65,8 +65,10 @@
       <section class="tabpage" id="tab-players" role="tabpanel" aria-label="Player Settings">
         <div class="row">
           <label class="inline"><input id="fSelf" type="checkbox" checked> Show Self</label>
-          <label class="inline"><input id="fPMCs" type="checkbox" checked> Show PMCs</label>
-          <label class="inline"><input id="fBots" type="checkbox" checked> Show Bots</label>
+          <label class="inline" data-game="abi"><input id="fPMCs" type="checkbox" checked> Show PMCs</label>
+          <label class="inline" data-game="abi"><input id="fBots" type="checkbox" checked> Show Bots</label>
+          <label class="inline" data-game="dayz"><input id="fPlayers" type="checkbox" checked> Show Players</label>
+          <label class="inline" data-game="dayz"><input id="fZombies" type="checkbox" checked> Show Zombies</label>
           <label class="inline"><input id="fDead" type="checkbox" checked> Show Dead</label>
           <label class="inline" title="Max draw distance (meters)">
             Max Range (m)
@@ -99,7 +101,7 @@
           </label>
         </div>
 
-        <div class="row">
+        <div class="row" data-game="abi">
           <label class="inline" title="Items below this price won't be shown">
             Min Price Filter (?)
             <input id="lootMinPrice" type="number" min="0" step="1000" value="0">

@@ -22,7 +22,9 @@ public sealed class OverlayWindow : IDisposable
         Raylib.SetWindowIcon(icon);
         Raylib.UnloadImage(icon);
         Win32IconHelper.SetWindowIcons("Assets/Img/Logo.ico");
-        Misc.ApplyAll(); 
+        Misc.ApplyAll();
+        // Overlay must paint over the taskbar; the work-area-respecting default leaves the bottom strip uncovered.
+        Misc.CoverTaskbarPrimaryMonitor();
         Raylib.ClearWindowState(ConfigFlags.VSyncHint);
         Raylib.SetTargetFPS(_fpsCap);
 

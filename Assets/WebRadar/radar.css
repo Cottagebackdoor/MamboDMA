@@ -86,6 +86,10 @@ button:hover{ background:#162035; }
 }
 #radar.dragging{ cursor:grabbing; }
 
+/* Hide game-specific UI based on body.game-* class set from /status. */
+body.game-abi  [data-game="dayz"]{ display:none !important; }
+body.game-dayz [data-game="abi"] { display:none !important; }
+
 /* Tooltip */
 #tooltip{
   position:fixed;

@@ -15,6 +15,7 @@ using static MamboDMA.OverlayWindow;
 using static MamboDMA.Misc;
 using MamboDMA.Games;
 using MamboDMA.Input;
+using MamboDMA.WebRadar;
 using System.Runtime.InteropServices;
 
 namespace MamboDMA.Games.ABI
@@ -23,6 +24,8 @@ namespace MamboDMA.Games.ABI
     {
         public string Name => "ArenaBreakoutInfinite";
         private bool _initialized, _running;
+
+        private static readonly ABIWebRadarFrameSource _webRadarSource = new();
 
         private static ABIGameConfig Cfg => Config<ABIGameConfig>.Settings;
 
@@ -168,7 +171,7 @@ namespace MamboDMA.Games.ABI
                                 attached ? new Vector4(0.85f, 0.75f, 0.15f, 1) :
                                            new Vector4(1, 0.3f, 0.2f, 1);
                 DrawStatusInline(statusCol,
-                    attached ? (_running ? "Attached ¡¤ Threads running" : "Attached ¡¤ Threads stopped")
+                    attached ? (_running ? "Attached ï¿½ï¿½ Threads running" : "Attached ï¿½ï¿½ Threads stopped")
                              : "Not attached");
 
                 ImGui.Separator();
@@ -181,7 +184,7 @@ namespace MamboDMA.Games.ABI
                         if (!vmmReady)
                         {
                             if (ImGui.Button("Init VMM")) VmmService.InitOnly();
-                            ImGui.SameLine(); ImGui.TextDisabled("¡û initialize before attaching");
+                            ImGui.SameLine(); ImGui.TextDisabled("ï¿½ï¿½ initialize before attaching");
                         }
                         else
                         {
@@ -189,7 +192,7 @@ namespace MamboDMA.Games.ABI
                             if (!attached)
                             {
                                 if (ImGui.Button($"Attach ({cfg.AbiExe})")) Attach();
-                                ImGui.SameLine(); ImGui.TextDisabled("¡û attaches without process picker");
+                                ImGui.SameLine(); ImGui.TextDisabled("ï¿½ï¿½ attaches without process picker");
                             }
                         }
 
@@ -215,7 +218,7 @@ namespace MamboDMA.Games.ABI
                         {
                             if (ImGui.Button("Open Loot List")) _showLootWindow = true;
                             ImGui.SameLine();
-                            ImGui.TextDisabled("¡û browse containers & ground loot");
+                            ImGui.TextDisabled("ï¿½ï¿½ browse containers & ground loot");
 
                             ImGui.Checkbox("Draw Boxes", ref cfg.DrawBoxes);
                             ImGui.Checkbox("Draw Names", ref cfg.DrawNames);
@@ -267,11 +270,11 @@ namespace MamboDMA.Games.ABI
 
                             ImGui.InputInt("Min Price (Regular Loot)", ref cfg.LootMinPriceRegular);
                             ImGui.SameLine();
-                            ImGui.TextDisabled("¡û Items below this won't show");
+                            ImGui.TextDisabled("ï¿½ï¿½ Items below this won't show");
 
                             ImGui.InputInt("Min Price (Important Loot)", ref cfg.LootMinPriceImportant);
                             ImGui.SameLine();
-                            ImGui.TextDisabled("¡û Items above this get special marker/color");
+                            ImGui.TextDisabled("ï¿½ï¿½ Items above this get special marker/color");
 
                             ImGui.Unindent(10f);
 
@@ -284,11 +287,11 @@ namespace MamboDMA.Games.ABI
 
                             ImGui.ColorEdit4("Regular Loot Color", ref cfg.LootRegularColor);
                             ImGui.SameLine();
-                            ImGui.TextDisabled("¡û Diamond marker");
+                            ImGui.TextDisabled("ï¿½ï¿½ Diamond marker");
 
                             ImGui.ColorEdit4("Important Loot Color", ref cfg.LootImportantColor);
                             ImGui.SameLine();
-                            ImGui.TextDisabled("¡û Star marker");
+                            ImGui.TextDisabled("ï¿½ï¿½ Star marker");
 
                             ImGui.Unindent(10f);
                         }
@@ -297,25 +300,25 @@ namespace MamboDMA.Games.ABI
                         {
                             ImGui.InputText("Include Filter (comma-sep)", ref cfg.LootFilterInclude, 256);
                             ImGui.SameLine();
-                            ImGui.TextDisabled("¡û Show only items matching these terms");
+                            ImGui.TextDisabled("ï¿½ï¿½ Show only items matching these terms");
 
                             ImGui.InputText("Exclude Filter (comma-sep)", ref cfg.LootFilterExclude, 256);
                             ImGui.SameLine();
-                            ImGui.TextDisabled("¡û Hide items matching these terms");
+                            ImGui.TextDisabled("ï¿½ï¿½ Hide items matching these terms");
                         }
 
                         if (ImGui.CollapsingHeader("Loot Widget"))
                         {
                             ImGui.Checkbox("Enable Loot Widget", ref cfg.DrawLootWidget);
                             ImGui.SameLine();
-                            ImGui.TextDisabled("¡û Real-time list of valuable loot");
+                            ImGui.TextDisabled("ï¿½ï¿½ Real-time list of valuable loot");
 
                             ImGui.InputInt("Max Items in Widget", ref cfg.LootWidgetMaxItems);
                             cfg.LootWidgetMaxItems = Math.Clamp(cfg.LootWidgetMaxItems, 5, 50);
 
                             ImGui.InputInt("Widget Min Price", ref cfg.LootWidgetMinPrice);
                             ImGui.SameLine();
-                            ImGui.TextDisabled("¡û Items must be worth this much to show in widget");
+                            ImGui.TextDisabled("ï¿½ï¿½ Items must be worth this much to show in widget");
 
                             ImGui.Checkbox("Show Distance in Widget", ref cfg.LootWidgetShowDistance);
 
@@ -335,7 +338,7 @@ namespace MamboDMA.Games.ABI
 
                     if (ImGui.BeginTabItem("WebRadar"))
                     {
-                        WebRadarUI.DrawPanel();
+                        WebRadarUI.DrawPanel(_webRadarSource);
                         ImGui.EndTabItem();
                     }
 
@@ -394,7 +397,7 @@ namespace MamboDMA.Games.ABI
             });
         }
 
-        // ©¤©¤©¤©¤©¤©¤©¤©¤©¤ Loot UI state ©¤©¤©¤©¤©¤©¤©¤©¤©¤
+        // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Loot UI state ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
         private static bool _showLootWindow = false;
         private static string _lootFilter = "";
 
@@ -457,9 +460,9 @@ namespace MamboDMA.Games.ABI
             if (ImGui.CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags.DefaultOpen))
             {
                 ImGui.TextDisabled($"Actors scanned: {snap.ActorsScanned}");
-                ImGui.TextDisabled($"Containers: {frame.ContainersFound}  ¡¤ Expanded: {frame.ContainersExpanded} (mgr {snap.ContainersExpandedMgr} / heu {snap.ContainersExpandedHeu})");
+                ImGui.TextDisabled($"Containers: {frame.ContainersFound}  ï¿½ï¿½ Expanded: {frame.ContainersExpanded} (mgr {snap.ContainersExpandedMgr} / heu {snap.ContainersExpandedHeu})");
                 ImGui.TextDisabled($"Loose items: {snap.ItemsLoose}");
-                ImGui.TextDisabled($"Prices ¡ú common: {snap.PricesFromCommon} ¡¤ provider: {snap.PricesFromProvider}");
+                ImGui.TextDisabled($"Prices ï¿½ï¿½ common: {snap.PricesFromCommon} ï¿½ï¿½ provider: {snap.PricesFromProvider}");
                 ImGui.TextDisabled($"Labels from common: {snap.LabelsFromCommon}");
             }
 
@@ -633,7 +636,7 @@ namespace MamboDMA.Games.ABI
         private static void DrawDebugBlock()
         {
             ImGui.Separator();
-            ImGui.Text("©¤ Debug Info ©¤");
+            ImGui.Text("ï¿½ï¿½ Debug Info ï¿½ï¿½");
             ImGui.Text($"UWorld: 0x{Players.UWorld:X}");
             ImGui.Text($"UGameInstance: 0x{Players.UGameInstance:X}");
             ImGui.Text($"GameState: 0x{Players.GameState:X}");
@@ -775,7 +778,7 @@ namespace MamboDMA.Games.ABI
             }
 
             ImGui.Separator();
-            ImGui.TextDisabled($"Makcu: {(Device.connected ? "Connected" : "Disconnected")} ¡¤ InputManager: {(InputManager.IsReady ? "Ready" : "Not Ready")}");
+            ImGui.TextDisabled($"Makcu: {(Device.connected ? "Connected" : "Disconnected")} ï¿½ï¿½ InputManager: {(InputManager.IsReady ? "Ready" : "Not Ready")}");
         }
 
         private static void DrawPlayersDebugWindow()
@@ -1189,7 +1192,7 @@ namespace MamboDMA.Games.ABI
                 uint zCol = U32(new Vector4(0.2f, 0.9f, 0.9f, 0.85f));
                 dl.AddCircle(center, rz, zCol, 64, 1.8f);
 
-                var label = $"Zoom {zi.Zoom:F2}x (Scope {zi.ScopeMag:F1}x ¡¤ {zi.Progress:P0})";
+                var label = $"Zoom {zi.Zoom:F2}x (Scope {zi.ScopeMag:F1}x ï¿½ï¿½ {zi.Progress:P0})";
                 var size = ImGui.CalcTextSize(label);
                 var at = new Vector2(center.X - size.X * 0.5f, center.Y + r + 6f);
                 dl.AddText(at, U32(new Vector4(0.9f, 0.9f, 0.9f, 0.95f)), label);

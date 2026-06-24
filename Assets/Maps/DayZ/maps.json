@@ -1,0 +1,10 @@
+{
+  "Alteria":       { "display": "Alteria",          "image": "alteria.png",       "imageSize": 8192,  "worldSize": 8192,  "flipZ": true },
+  "Banov":         { "display": "Banov",            "image": "banov.png",         "imageSize": 15360, "worldSize": 15360, "flipZ": true },
+  "ChernarusPlus": { "display": "Chernarus Plus",   "image": "chernarusplus.png", "imageSize": 15360, "worldSize": 15360, "flipZ": true },
+  "DeadFall":      { "display": "DeadFall",         "image": "deadfall.png",      "imageSize": 10000, "worldSize": 10000, "flipZ": true },
+  "Livonia":       { "display": "Livonia / Enoch",  "image": "livonia.png",       "imageSize": 15360, "worldSize": 12800, "flipZ": true },
+  "Namalsk":       { "display": "Namalsk",          "image": "namalsk.png",       "imageSize": 12800, "worldSize": 12800, "flipZ": true },
+  "Sakhal":        { "display": "Sakhal",           "image": "sakhal.png",        "imageSize": 15360, "worldSize": 15360, "flipZ": true },
+  "Takistan":      { "display": "Takistan",         "image": "takistan.png",      "imageSize": 12800, "worldSize": 12800, "flipZ": true }
+}

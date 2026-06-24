@@ -29,6 +29,8 @@
   const fSelfEl    = document.getElementById("fSelf");
   const fPMCsEl    = document.getElementById("fPMCs");
   const fBotsEl    = document.getElementById("fBots");
+  const fPlayersEl = document.getElementById("fPlayers");
+  const fZombiesEl = document.getElementById("fZombies");
   const fDeadEl    = document.getElementById("fDead");
   const maxRangeEl = document.getElementById("maxRange");
   const szSelfEl   = document.getElementById("szSelf");
@@ -61,12 +63,15 @@
   let es=null, pollTimer=null;
   let lastFrame = null;
   let frameCount = 0; // DEBUG COUNTER
+  let currentGame = "abi"; // gates per-game UI; updated from /status
 
   // Map state
   let mapList = [];
   let activeMap = null;
   let mapImg = new Image();
   let imgPan = { x:0, y:0 };
+  // Tracks server's selectedMap to detect transitions; null means "no server preference yet".
+  let lastServerSelectedMap = null;
 
   // --------- CALIBRATION STATE ---------
   let currentSession = null;
@@ -130,6 +135,40 @@
     return `${dir.replace(/\/+$/,"")}/${file.replace(/^\/+/,"")}`;
   }
 
+  function applyGameMode(game){
+    const g = (game === "dayz") ? "dayz" : "abi"; // unknown/missing falls back to ABI for compat
+    if (g !== currentGame) lastServerSelectedMap = null; // game transition invalidates cached server map
+    currentGame = g;
+    document.body.classList.remove("game-abi", "game-dayz");
+    document.body.classList.add("game-" + g);
+    // Map dropdown is server-controlled in DayZ; ABI keeps user picker.
+    if (mapSelEl) mapSelEl.disabled = (g === "dayz");
+  }
+
+  // Browser follows server's selectedMap so DayZ "Map" panel is single source of truth.
+  function syncServerSelectedMap(frame){
+    if (!frame || currentGame !== "dayz") return;
+    const sel = frame.selectedMap;
+    if (typeof sel !== "string" || !sel) return;
+    if (sel === lastServerSelectedMap) return;
+    // Don't cache until we've actually committed to a switch, otherwise a mapList-not-ready-yet frame poisons the cache and later valid frames are suppressed.
+    const match = mapList.find(m => m.name.toLowerCase() === sel.toLowerCase());
+    if (!match) return;
+    if (activeMap && activeMap.name === match.name) { lastServerSelectedMap = sel; return; }
+    lastServerSelectedMap = sel;
+    if (mapSelEl) mapSelEl.value = match.name;
+    setActiveMapByName(match.name).then(()=> drawFrame(lastFrame));
+  }
+
+  async function fetchGameMode(){
+    try {
+      const r = await fetch(baseUrl() + "/status", { cache:"no-store" });
+      if (!r.ok) return;
+      const j = await r.json();
+      applyGameMode(j && j.game);
+    } catch {}
+  }
+
   async function fetchJsonNoThrow(url, init){
     try{
       const r = await fetch(url, Object.assign({ cache:"no-store" }, init || {}));
@@ -143,6 +182,10 @@
     const url = mapMeta.url || ("/" + (mapMeta.file || ""));
     const dir = urlDirname(url);
     const name = mapMeta.name;
+
+    // Generic sidecar route delegates to the active game's frame source (DayZ translates schema; ABI reads file).
+    const sidecar = await fetchJsonNoThrow(`/api/mapsidecar/${encodeURIComponent(name)}`);
+    if (sidecar) return { cfg: sidecar, source: `/api/mapsidecar/${name}` };
 
     const mapCfgUrl = joinUrl(dir, `${name}.json`);
     const exact = await fetchJsonNoThrow(mapCfgUrl);
@@ -455,15 +498,26 @@
         if (a.self === true) continue;
         if (selfId != null && (a.id === selfId || a.pawn === selfId)) continue;
         
+        const isZombieHover = a.kind === "zombie";
+        const isDayzPlayerHover = a.kind === "player";
+
         if (a.dead && !showDead) continue;
-        if (a.bot && !showBots) continue;
-        if (!a.bot && !a.dead && !showPMCs) continue;
+        if (isZombieHover && !(fZombiesEl?.checked)) continue;
+        if (isDayzPlayerHover && !(fPlayersEl?.checked)) continue;
+        if (!isZombieHover && !isDayzPlayerHover) {
+          if (a.bot && !showBots) continue;
+          if (!a.bot && !a.dead && !showPMCs) continue;
+        }
 
         const img = worldToImagePx(a.x, a.y, v);
         const x = R.dx + img[0]*R.s, y = R.dy + img[1]*R.s;
         if (inRange(x, y)){
+          const hoverType = a.dead ? 'dead'
+                          : isZombieHover ? 'zombie'
+                          : isDayzPlayerHover ? 'player'
+                          : (a.bot ? 'bot' : 'pmc');
           return {
-            type: a.dead ? 'dead' : (a.bot ? 'bot' : 'pmc'),
+            type: hoverType,
             data: a,
             screenX: x / dpr,
             screenY: y / dpr
@@ -500,22 +554,34 @@
     }
     else if (entity.type === 'container'){
       const cont = entity.data;
-      html = `<div class="tt-header">Container</div>`;
-      html += `<div class="tt-row"><span class="tt-label">Items:</span><span class="tt-value">${cont.count || 0}</span></div>`;
-      
-      if (cont.totalValue && cont.totalValue > 0){
-        html += `<div class="tt-row"><span class="tt-label">Total Value:</span><span class="tt-value tt-price">?${cont.totalValue.toLocaleString()}</span></div>`;
+      if (cont.kind === 'vehicle') {
+        html = `<div class="tt-header">Vehicle</div>`;
+        const dist = calculateDistance(cont, lastFrame?.self);
+        if (dist !== null){
+          html += `<div class="tt-row"><span class="tt-label">Distance:</span><span class="tt-value">${dist.toFixed(1)}m</span></div>`;
+        }
+      } else {
+        html = `<div class="tt-header">Container</div>`;
+        html += `<div class="tt-row"><span class="tt-label">Items:</span><span class="tt-value">${cont.count || 0}</span></div>`;
+
+        if (cont.totalValue && cont.totalValue > 0){
+          html += `<div class="tt-row"><span class="tt-label">Total Value:</span><span class="tt-value tt-price">?${cont.totalValue.toLocaleString()}</span></div>`;
+        }
+
+        const dist = calculateDistance(cont, lastFrame?.self);
+        if (dist !== null){
+          html += `<div class="tt-row"><span class="tt-label">Distance:</span><span class="tt-value">${dist.toFixed(1)}m</span></div>`;
+        }
+        html += `<div class="tt-row"><span class="tt-label">Status:</span><span class="tt-value">${cont.count > 0 ? 'Has Loot' : 'Empty'}</span></div>`;
       }
-      
-      const dist = calculateDistance(cont, lastFrame?.self);
-      if (dist !== null){
-        html += `<div class="tt-row"><span class="tt-label">Distance:</span><span class="tt-value">${dist.toFixed(1)}m</span></div>`;
-      }
-      html += `<div class="tt-row"><span class="tt-label">Status:</span><span class="tt-value">${cont.count > 0 ? 'Has Loot' : 'Empty'}</span></div>`;
     }
-    else if (entity.type === 'pmc' || entity.type === 'bot' || entity.type === 'dead'){
+    else if (entity.type === 'pmc' || entity.type === 'bot' || entity.type === 'dead' || entity.type === 'zombie' || entity.type === 'player'){
       const actor = entity.data;
-      const typeName = entity.type === 'dead' ? 'Dead' : (entity.type === 'bot' ? 'Bot' : 'PMC');
+      const typeName = entity.type === 'dead' ? 'Dead'
+                     : entity.type === 'bot' ? 'Bot'
+                     : entity.type === 'zombie' ? 'Zombie'
+                     : entity.type === 'player' ? 'Player'
+                     : 'PMC';
       html = `<div class="tt-header">${typeName}</div>`;
       
       const dist = calculateDistance(actor, lastFrame?.self);
@@ -525,7 +591,7 @@
       
       if (actor.z !== undefined && lastFrame?.self?.z !== undefined){
         const heightDiff = actor.z - lastFrame.self.z;
-        const heightDir = heightDiff > 50 ? '¡ü' : (heightDiff < -50 ? '¡ý' : '¡ú');
+        const heightDir = heightDiff > 50 ? 'ï¿½ï¿½' : (heightDiff < -50 ? 'ï¿½ï¿½' : 'ï¿½ï¿½');
         html += `<div class="tt-row"><span class="tt-label">Elevation:</span><span class="tt-value">${heightDir} ${Math.abs(heightDiff/100).toFixed(1)}m</span></div>`;
       }
 
@@ -683,11 +749,14 @@
             const img = worldToImagePx(cont.x, cont.y, v);
             const x = R.dx + img[0]*R.s, y = R.dy + img[1]*R.s;
             
-            let color = cont.count === 0 ? cContainerEmpty : cContainerFilled;
+            let color;
+            if (cont.kind === "vehicle") color = "#00aaff";
+            else if (cont.count === 0) color = cContainerEmpty;
+            else color = cContainerFilled;
             if (cont.totalValue && cont.totalValue >= lootImportantThreshold) {
               color = cContainerImportant;
             }
-            
+
             drawContainerMarker(x, y, rContainer, color);
           }
         }
@@ -714,20 +783,35 @@
             const az  = (typeof a.z   === "number") ? a.z   : 0;
             const altArrow = (frame.self && Math.abs(az - selfZ) > 50) ? (az > selfZ ? 'up' : 'down') : null;
 
-            if (a.dead) { 
-              if (!showDead) continue; 
-              drawEntityCircleWithHeading(x,y,rDead, yaw, cDead, altArrow); 
+            const isZombie = a.kind === "zombie";
+            const isDayzPlayer = a.kind === "player";
+            if (a.dead) {
+              if (!showDead) continue;
+              drawEntityCircleWithHeading(x,y,rDead, yaw, cDead, altArrow);
               drawnActors++;
-              continue; 
+              continue;
             }
-            if (a.bot) { 
-              if (!showBots) continue; 
-              drawEntityCircleWithHeading(x,y,rBot,  yaw, cBot,  altArrow); 
+            if (isZombie) {
+              if (!(fZombiesEl?.checked)) continue; // zombies are NEVER gated by the ABI Bots checkbox
+              const zombieColor = lastFrame?.colors?.zombie || "#ff3030";
+              drawEntityCircleWithHeading(x,y,rBot, yaw, zombieColor, altArrow);
+              drawnActors++;
+              continue;
+            }
+            if (isDayzPlayer) {
+              if (!(fPlayersEl?.checked)) continue;
+              drawEntityCircleWithHeading(x,y,rPMC, yaw, cPMC, altArrow);
+              drawnActors++;
+              continue;
+            }
+            if (a.bot) {
+              if (!showBots) continue;
+              drawEntityCircleWithHeading(x,y,rBot, yaw, cBot, altArrow);
               drawnActors++;
             }
-            else { 
-              if (!showPMCs) continue; 
-              drawEntityCircleWithHeading(x,y,rPMC, yaw, cPMC, altArrow); 
+            else {
+              if (!showPMCs) continue;
+              drawEntityCircleWithHeading(x,y,rPMC, yaw, cPMC, altArrow);
               drawnActors++;
             }
           }
@@ -867,8 +951,9 @@
     }, null, 2);
 
     let ok = false;
+    // Generic save route; HandleSidecarPut was removed when WebRadarServer became game-agnostic.
     try{
-      const r = await fetch(sidecarPath, {
+      const r = await fetch(`/api/mapsidecar/${encodeURIComponent(name)}`, {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: payload
@@ -911,6 +996,7 @@
   function connect(){
     const base = baseUrl();
     console.log(`[WebRadar] ? Connecting to ${base}`);
+    fetchGameMode(); // re-detect game when user (re)connects, may have switched server
     
     try { 
       es = new EventSource(base + "/stream"); 
@@ -921,7 +1007,7 @@
       return startPolling(base); 
     }
     
-    statusEl.textContent="connecting¡­"; btnConn.textContent="Connecting¡­";
+    statusEl.textContent="connectingï¿½ï¿½"; btnConn.textContent="Connectingï¿½ï¿½";
     
     es.addEventListener("open", ()=>{
       console.log("[WebRadar] ? SSE connection established");
@@ -936,10 +1022,10 @@
     });
     
     es.addEventListener("frame", ev=>{
-      try { 
+      try {
         lastFrame = JSON.parse(ev.data);
         frameCount++;
-        
+
         if (frameCount <= 3 || frameCount % 100 === 0) {
           console.log(`[WebRadar] ? Frame #${frameCount}:`, {
             ok: lastFrame.ok,
@@ -949,7 +1035,8 @@
             self: lastFrame.self ? `(${lastFrame.self.x.toFixed(0)}, ${lastFrame.self.y.toFixed(0)})` : 'MISSING'
           });
         }
-        
+
+        syncServerSelectedMap(lastFrame);
         drawFrame(lastFrame);
       } catch (e) { 
         console.error("[WebRadar] Failed to parse frame:", e);
@@ -971,10 +1058,10 @@
           }
           return r.json();
         })
-        .then(j => { 
-          lastFrame=j; 
+        .then(j => {
+          lastFrame=j;
           frameCount++;
-          
+
           if (frameCount <= 3 || frameCount % 100 === 0) {
             console.log(`[WebRadar] ? Poll frame #${frameCount}:`, {
               ok: j.ok,
@@ -982,8 +1069,9 @@
               self: j.self ? `(${j.self.x.toFixed(0)}, ${j.self.y.toFixed(0)})` : 'MISSING'
             });
           }
-          
-          drawFrame(lastFrame); 
+
+          syncServerSelectedMap(lastFrame);
+          drawFrame(lastFrame);
         })
         .catch((err)=>{
           console.error("[WebRadar] Polling error:", err);
@@ -1000,6 +1088,7 @@
     statusEl.textContent="disconnected"; btnConn.textContent="Connect";
     lastFrame = null;
     frameCount = 0;
+    lastServerSelectedMap = null; // re-apply on next connect
   }
 
   // --------- Interaction ---------
@@ -1115,7 +1204,7 @@
   mapSelEl?.addEventListener("change", ()=>{ setActiveMapByName(mapSelEl.value).then(()=> drawFrame(lastFrame)); });
   
   for (const el of [zoomEl, inScaleEl, yFlipEl,
-                    fSelfEl, fPMCsEl, fBotsEl, fDeadEl, maxRangeEl,
+                    fSelfEl, fPMCsEl, fBotsEl, fPlayersEl, fZombiesEl, fDeadEl, maxRangeEl,
                     szSelfEl, szPMCEl, szBotEl, szDeadEl,
                     colSelfEl, colPMCEl, colBotEl, colDeadEl,
                     fLootEl, fContainersEl, fEmptyContainersEl, lootMaxRangeEl, lootMinPriceEl,
@@ -1147,6 +1236,7 @@
   }
 
   console.log("[WebRadar] ? Initializing...");
+  fetchGameMode(); // body stays game-abi until /status responds, preserving ABI defaults
   refreshMapList().then(()=> {
     console.log("[WebRadar] ? Initialization complete");
     drawFrame(null);
